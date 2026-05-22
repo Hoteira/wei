@@ -39,11 +39,29 @@ impl<'a> Parser<'a> {
             if name == "let" {
                 return self.parse_let();
             }
+            if name == "par" {
+                return self.parse_par();
+            }
             if matches!(self.tokens.get(self.pos + 1), Some(Token::Eq)) {
                 return self.parse_assign();
             }
         }
         self.parse_call()
+    }
+
+    fn parse_par(&mut self) -> Stmt {
+        self.pos += 1; // consume "par"
+        let name = self.expect_ident();
+        self.expect_colon();
+        self.skip_newlines();
+        self.expect_indent();
+        let mut body = Vec::new();
+        while !matches!(self.peek(), Token::Dedent | Token::Eof) {
+            body.push(self.parse_statement());
+            self.skip_newlines();
+        }
+        self.expect_dedent();
+        Stmt::Par { name, body }
     }
 
     fn parse_assign(&mut self) -> Stmt {
@@ -82,12 +100,13 @@ impl<'a> Parser<'a> {
     fn parse_call(&mut self) -> Stmt {
         let name = self.expect_ident();
         self.expect_lparen();
-        let arg = self.parse_expr();
+        let args = if matches!(self.peek(), Token::RParen) {
+            Vec::new()
+        } else {
+            vec![self.parse_expr()]
+        };
         self.expect_rparen();
-        Stmt::Call {
-            name,
-            args: vec![arg],
-        }
+        Stmt::Call { name, args }
     }
 
     fn parse_expr(&mut self) -> Expr {
@@ -181,6 +200,30 @@ impl<'a> Parser<'a> {
         self.pos += 1;
         if !matches!(t, Token::Eq) {
             panic!("parse error: expected '=', got {:?}", t);
+        }
+    }
+
+    fn expect_colon(&mut self) {
+        let t = self.tokens[self.pos].clone();
+        self.pos += 1;
+        if !matches!(t, Token::Colon) {
+            panic!("parse error: expected ':', got {:?}", t);
+        }
+    }
+
+    fn expect_indent(&mut self) {
+        let t = self.tokens[self.pos].clone();
+        self.pos += 1;
+        if !matches!(t, Token::Indent) {
+            panic!("parse error: expected indent, got {:?}", t);
+        }
+    }
+
+    fn expect_dedent(&mut self) {
+        let t = self.tokens[self.pos].clone();
+        self.pos += 1;
+        if !matches!(t, Token::Dedent) {
+            panic!("parse error: expected dedent, got {:?}", t);
         }
     }
 }

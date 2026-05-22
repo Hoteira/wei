@@ -14,6 +14,10 @@ pub enum Stmt {
         name: String,
         value: Expr,
     },
+    Par {
+        name: String,
+        body: Vec<Stmt>,
+    },
     Call {
         name: String,
         args: Vec<Expr>,

@@ -1,0 +1,7 @@
+let n uint(3) = 5
+
+par add_three:
+    n = n + 3
+
+add_three()
+print(n)

@@ -18,10 +18,25 @@ const SCRATCH_END: u64 = SCRATCH_SIZE;
 pub fn emit(program: &Program) -> Vec<u8> {
     let mut g = Codegen::new();
     g.collect_symbols(program);
+    g.register_paragraphs(program);
+
     for stmt in &program.statements {
-        g.emit_stmt(stmt);
+        if !matches!(stmt, Stmt::Par { .. }) {
+            g.emit_stmt(stmt);
+        }
     }
     g.emit_exit();
+
+    for stmt in &program.statements {
+        if let Stmt::Par { name, body } = stmt {
+            g.start_paragraph(name);
+            for s in body {
+                g.emit_stmt(s);
+            }
+            g.emit_ret();
+        }
+    }
+
     g.finalize()
 }
 
@@ -40,6 +55,8 @@ struct Codegen {
     data: Vec<u8>,
     symbols: Vec<Symbol>,
     relocs: Vec<Reloc>,
+    paragraphs: Vec<(String, Option<usize>)>,
+    par_calls: Vec<(usize, String)>,
 }
 
 impl Codegen {
@@ -51,7 +68,45 @@ impl Codegen {
             data,
             symbols: Vec::new(),
             relocs: Vec::new(),
+            paragraphs: Vec::new(),
+            par_calls: Vec::new(),
         }
+    }
+
+    fn register_paragraphs(&mut self, program: &Program) {
+        for stmt in &program.statements {
+            if let Stmt::Par { name, .. } = stmt {
+                if self.paragraphs.iter().any(|(n, _)| n == name) {
+                    panic!("codegen: paragraph `{}` defined more than once", name);
+                }
+                self.paragraphs.push((name.clone(), None));
+            }
+        }
+    }
+
+    fn start_paragraph(&mut self, name: &str) {
+        let offset = self.code.len();
+        let entry = self
+            .paragraphs
+            .iter_mut()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("codegen: paragraph `{}` not registered", name));
+        entry.1 = Some(offset);
+    }
+
+    fn has_paragraph(&self, name: &str) -> bool {
+        self.paragraphs.iter().any(|(n, _)| n == name)
+    }
+
+    fn emit_call_paragraph(&mut self, name: &str) {
+        self.code.push(0xE8);
+        let pos = self.code.len();
+        self.code.extend_from_slice(&[0u8; 4]);
+        self.par_calls.push((pos, name.to_string()));
+    }
+
+    fn emit_ret(&mut self) {
+        self.code.push(0xC3);
     }
 
     fn collect_symbols(&mut self, program: &Program) {
@@ -77,16 +132,22 @@ impl Codegen {
 
     fn emit_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Let { .. } => {}
+            Stmt::Let { .. } | Stmt::Par { .. } => {}
             Stmt::Assign { name, value } => self.emit_assign(name, value),
-            Stmt::Call { name, args } if name == "print" => {
-                if args.len() != 1 {
-                    panic!("codegen: print() takes exactly one argument");
+            Stmt::Call { name, args } => {
+                if name == "print" {
+                    if args.len() != 1 {
+                        panic!("codegen: print() takes exactly one argument");
+                    }
+                    self.emit_print(&args[0]);
+                } else if self.has_paragraph(name) {
+                    if !args.is_empty() {
+                        panic!("codegen: paragraph `{}` is param-less", name);
+                    }
+                    self.emit_call_paragraph(name);
+                } else {
+                    panic!("codegen: unknown function `{}`", name);
                 }
-                self.emit_print(&args[0]);
-            }
-            Stmt::Call { name, .. } => {
-                panic!("codegen: unknown function `{}`", name);
             }
         }
     }
@@ -193,6 +254,22 @@ impl Codegen {
         for r in &self.relocs {
             let addr = ENTRY_VMA + code_size + r.data_offset;
             self.code[r.code_pos..r.code_pos + 8].copy_from_slice(&addr.to_le_bytes());
+        }
+        for (pos, name) in &self.par_calls {
+            let target = self
+                .paragraphs
+                .iter()
+                .find(|(n, _)| n == name)
+                .and_then(|(_, addr)| *addr)
+                .unwrap_or_else(|| panic!("codegen: paragraph `{}` not defined", name));
+            let rel = target as i64 - (pos + 4) as i64;
+            assert!(
+                (i32::MIN as i64..=i32::MAX as i64).contains(&rel),
+                "call displacement {} out of i32 range",
+                rel
+            );
+            let bytes = (rel as i32).to_le_bytes();
+            self.code[*pos..*pos + 4].copy_from_slice(&bytes);
         }
         let mut segment = self.code;
         segment.extend_from_slice(&self.data);
