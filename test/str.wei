@@ -1,0 +1,11 @@
+let greeting str(13) = "Hello, World!"
+let short str(10) = "abc"
+
+par main:
+    print("[")
+    print(greeting)
+    print("][")
+    print(short)
+    print("]")
+
+main()

@@ -1,4 +1,4 @@
-use crate::ast::{BinOp, CmpOp, Expr, Program, Stmt, TypeExpr};
+use crate::ast::{BinOp, CmpOp, Expr, LValue, Program, Stmt, TypeExpr};
 use crate::lexer::Token;
 
 pub fn parse(tokens: &[Token]) -> Program {
@@ -48,11 +48,60 @@ impl<'a> Parser<'a> {
             if name == "while" {
                 return self.parse_while();
             }
-            if matches!(self.tokens.get(self.pos + 1), Some(Token::Eq)) {
+            if name == "type" {
+                return self.parse_typedef();
+            }
+            if self.looks_like_assignment() {
                 return self.parse_assign();
             }
         }
         self.parse_call()
+    }
+
+    fn looks_like_assignment(&self) -> bool {
+        let mut p = self.pos;
+        if !matches!(self.tokens.get(p), Some(Token::Ident(_))) {
+            return false;
+        }
+        p += 1;
+        while matches!(self.tokens.get(p), Some(Token::Dot)) {
+            p += 1;
+            if !matches!(self.tokens.get(p), Some(Token::Ident(_))) {
+                return false;
+            }
+            p += 1;
+        }
+        matches!(self.tokens.get(p), Some(Token::Eq))
+    }
+
+    fn parse_typedef(&mut self) -> Stmt {
+        self.pos += 1; // consume "type"
+        let name = self.expect_ident();
+        self.expect_colon();
+        self.skip_newlines();
+        self.expect_indent();
+        let mut fields = Vec::new();
+        while !matches!(self.peek(), Token::Dedent | Token::Eof) {
+            let fname = self.expect_ident();
+            let ty = self.parse_type();
+            fields.push((fname, ty));
+            self.skip_newlines();
+        }
+        self.expect_dedent();
+        Stmt::TypeDef { name, fields }
+    }
+
+    fn parse_lvalue(&mut self) -> LValue {
+        let mut lv = LValue::Ident(self.expect_ident());
+        while matches!(self.peek(), Token::Dot) {
+            self.pos += 1;
+            let field = self.expect_ident();
+            lv = LValue::Field {
+                base: Box::new(lv),
+                field,
+            };
+        }
+        lv
     }
 
     fn parse_while(&mut self) -> Stmt {
@@ -113,35 +162,44 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_assign(&mut self) -> Stmt {
-        let name = self.expect_ident();
+        let target = self.parse_lvalue();
         self.expect_eq();
         let value = self.parse_expr();
-        Stmt::Assign { name, value }
+        Stmt::Assign { target, value }
     }
 
     fn parse_let(&mut self) -> Stmt {
         self.pos += 1; // consume "let"
         let name = self.expect_ident();
         let ty = self.parse_type();
-        self.expect_eq();
-        let init = self.parse_expr();
+        let init = if matches!(self.peek(), Token::Eq) {
+            self.pos += 1;
+            Some(self.parse_expr())
+        } else {
+            None
+        };
         Stmt::Let { name, ty, init }
     }
 
     fn parse_type(&mut self) -> TypeExpr {
         let name = self.expect_ident();
-        self.expect_lparen();
-        let n = match self.tokens[self.pos].clone() {
-            Token::IntLit(n) => {
-                self.pos += 1;
-                n
+        if matches!(self.peek(), Token::LParen) {
+            self.pos += 1;
+            let n = match self.tokens[self.pos].clone() {
+                Token::IntLit(n) => {
+                    self.pos += 1;
+                    n
+                }
+                other => panic!("parse error: expected integer in type, got {:?}", other),
+            };
+            self.expect_rparen();
+            match name.as_str() {
+                "uint" => TypeExpr::UInt(n as u32),
+                "str" => TypeExpr::Str(n as u32),
+                other => panic!("parse error: unknown parameterized type `{}`", other),
             }
-            other => panic!("parse error: expected integer in type, got {:?}", other),
-        };
-        self.expect_rparen();
-        match name.as_str() {
-            "uint" => TypeExpr::UInt(n as u32),
-            other => panic!("parse error: unknown type `{}`", other),
+        } else {
+            TypeExpr::Record(name)
         }
     }
 
@@ -207,7 +265,20 @@ impl<'a> Parser<'a> {
                 inner: Box::new(inner),
             };
         }
-        self.parse_atom()
+        self.parse_postfix()
+    }
+
+    fn parse_postfix(&mut self) -> Expr {
+        let mut expr = self.parse_atom();
+        while matches!(self.peek(), Token::Dot) {
+            self.pos += 1;
+            let field = self.expect_ident();
+            expr = Expr::FieldAccess {
+                base: Box::new(expr),
+                field,
+            };
+        }
+        expr
     }
 
     fn parse_atom(&mut self) -> Expr {

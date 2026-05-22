@@ -8,10 +8,10 @@ pub enum Stmt {
     Let {
         name: String,
         ty: TypeExpr,
-        init: Expr,
+        init: Option<Expr>,
     },
     Assign {
-        name: String,
+        target: LValue,
         value: Expr,
     },
     Par {
@@ -32,11 +32,23 @@ pub enum Stmt {
         name: String,
         args: Vec<Expr>,
     },
+    TypeDef {
+        name: String,
+        fields: Vec<(String, TypeExpr)>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum LValue {
+    Ident(String),
+    Field { base: Box<LValue>, field: String },
 }
 
 #[derive(Debug, Clone)]
 pub enum TypeExpr {
     UInt(u32),
+    Str(u32),
+    Record(String),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -75,5 +87,9 @@ pub enum Expr {
     },
     Not {
         inner: Box<Expr>,
+    },
+    FieldAccess {
+        base: Box<Expr>,
+        field: String,
     },
 }

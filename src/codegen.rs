@@ -1,5 +1,6 @@
-use crate::ast::{BinOp, CmpOp, Expr, Program, Stmt};
+use crate::ast::{BinOp, CmpOp, Expr, LValue, Program, Stmt, TypeExpr};
 use crate::elf::ENTRY_VMA;
+use std::collections::HashMap;
 
 const RAX: u8 = 0;
 const RCX: u8 = 1;
@@ -17,11 +18,12 @@ const SCRATCH_END: u64 = SCRATCH_SIZE;
 
 pub fn emit(program: &Program) -> Vec<u8> {
     let mut g = Codegen::new();
+    g.register_typedefs(program);
     g.collect_symbols(program);
     g.register_paragraphs(program);
 
     for stmt in &program.statements {
-        if !matches!(stmt, Stmt::Par { .. }) {
+        if !matches!(stmt, Stmt::Par { .. } | Stmt::TypeDef { .. }) {
             g.emit_stmt(stmt);
         }
     }
@@ -43,11 +45,23 @@ pub fn emit(program: &Program) -> Vec<u8> {
 struct Symbol {
     name: String,
     offset_in_data: u64,
+    ty: TypeExpr,
 }
 
 struct Reloc {
     code_pos: usize,
     data_offset: u64,
+}
+
+struct RecordInfo {
+    fields: Vec<RecordField>,
+    size: u64,
+}
+
+struct RecordField {
+    name: String,
+    offset: u64,
+    ty: TypeExpr,
 }
 
 struct Codegen {
@@ -57,6 +71,7 @@ struct Codegen {
     relocs: Vec<Reloc>,
     paragraphs: Vec<(String, Option<usize>)>,
     par_calls: Vec<(usize, String)>,
+    record_types: HashMap<String, RecordInfo>,
 }
 
 impl Codegen {
@@ -70,6 +85,32 @@ impl Codegen {
             relocs: Vec::new(),
             paragraphs: Vec::new(),
             par_calls: Vec::new(),
+            record_types: HashMap::new(),
+        }
+    }
+
+    fn register_typedefs(&mut self, program: &Program) {
+        for stmt in &program.statements {
+            if let Stmt::TypeDef { name, fields } = stmt {
+                let mut offset = 0u64;
+                let mut field_list = Vec::new();
+                for (fname, ty) in fields {
+                    let field_size = type_size(ty);
+                    field_list.push(RecordField {
+                        name: fname.clone(),
+                        offset,
+                        ty: ty.clone(),
+                    });
+                    offset += field_size;
+                }
+                self.record_types.insert(
+                    name.clone(),
+                    RecordInfo {
+                        fields: field_list,
+                        size: offset,
+                    },
+                );
+            }
         }
     }
 
@@ -111,14 +152,85 @@ impl Codegen {
 
     fn collect_symbols(&mut self, program: &Program) {
         for stmt in &program.statements {
-            if let Stmt::Let { name, init, .. } = stmt {
-                let v = eval_const(init).expect_int();
+            if let Stmt::Let { name, ty, init } = stmt {
                 let offset = self.data.len() as u64;
-                self.data.extend_from_slice(&(v as u64).to_le_bytes());
+                match (ty, init) {
+                    (TypeExpr::UInt(_), Some(init_expr)) => {
+                        let v = eval_const(init_expr).expect_int();
+                        self.data.extend_from_slice(&(v as u64).to_le_bytes());
+                    }
+                    (TypeExpr::UInt(_), None) => {
+                        self.data.extend_from_slice(&[0u8; 8]);
+                    }
+                    (TypeExpr::Str(n), Some(init_expr)) => {
+                        let s = match eval_const(init_expr) {
+                            ConstValue::Str(s) => s,
+                            _ => panic!("codegen: str init must be a string literal"),
+                        };
+                        let width = *n as usize;
+                        if s.len() > width {
+                            panic!(
+                                "codegen: string literal of {} bytes exceeds str({})",
+                                s.len(),
+                                width
+                            );
+                        }
+                        let mut bytes = s.into_bytes();
+                        bytes.resize(width, b' ');
+                        self.data.extend_from_slice(&bytes);
+                    }
+                    (TypeExpr::Str(n), None) => {
+                        self.data.extend_from_slice(&vec![b' '; *n as usize]);
+                    }
+                    (TypeExpr::Record(rname), _) => {
+                        let info = self.record_types.get(rname).unwrap_or_else(|| {
+                            panic!("codegen: undefined record type `{}`", rname)
+                        });
+                        self.data.extend_from_slice(&vec![0u8; info.size as usize]);
+                    }
+                }
                 self.symbols.push(Symbol {
                     name: name.clone(),
                     offset_in_data: offset,
+                    ty: ty.clone(),
                 });
+            }
+        }
+    }
+
+    fn lvalue_data_offset(&self, lv: &LValue) -> u64 {
+        match lv {
+            LValue::Ident(name) => self.lookup_symbol(name).offset_in_data,
+            LValue::Field { base, field } => {
+                let (base_offset, base_record) = self.lvalue_record_info(base);
+                let info = self
+                    .record_types
+                    .get(&base_record)
+                    .unwrap_or_else(|| panic!("codegen: unknown record `{}`", base_record));
+                let f = info
+                    .fields
+                    .iter()
+                    .find(|f| f.name == *field)
+                    .unwrap_or_else(|| {
+                        panic!("codegen: no field `{}` in record `{}`", field, base_record)
+                    });
+                base_offset + f.offset
+            }
+        }
+    }
+
+    fn lvalue_record_info(&self, lv: &LValue) -> (u64, String) {
+        match lv {
+            LValue::Ident(name) => {
+                let sym = self.lookup_symbol(name);
+                let r = match &sym.ty {
+                    TypeExpr::Record(rname) => rname.clone(),
+                    _ => panic!("codegen: `{}` is not a record", name),
+                };
+                (sym.offset_in_data, r)
+            }
+            LValue::Field { .. } => {
+                panic!("codegen: nested record field access not supported yet");
             }
         }
     }
@@ -132,8 +244,8 @@ impl Codegen {
 
     fn emit_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Let { .. } | Stmt::Par { .. } => {}
-            Stmt::Assign { name, value } => self.emit_assign(name, value),
+            Stmt::Let { .. } | Stmt::Par { .. } | Stmt::TypeDef { .. } => {}
+            Stmt::Assign { target, value } => self.emit_assign(target, value),
             Stmt::For {
                 var, start, end, body,
             } => self.emit_for(var, start, end, body),
@@ -181,6 +293,7 @@ impl Codegen {
         self.symbols.push(Symbol {
             name: var.to_string(),
             offset_in_data: var_offset,
+            ty: TypeExpr::UInt(18),
         });
 
         self.emit_expr(start);
@@ -216,9 +329,9 @@ impl Codegen {
         self.symbols.pop();
     }
 
-    fn emit_assign(&mut self, name: &str, value: &Expr) {
+    fn emit_assign(&mut self, target: &LValue, value: &Expr) {
         self.emit_expr(value);
-        let offset = self.lookup_symbol(name).offset_in_data;
+        let offset = self.lvalue_data_offset(target);
         self.emit_mov_imm64_reloc(RBX, offset);
         self.emit_mov_at_rbx_rax();
     }
@@ -230,9 +343,43 @@ impl Codegen {
                 ConstValue::Int(n) => n.to_string(),
             };
             self.emit_print_const(s);
+        } else if let Some((offset, len)) = self.try_resolve_str_ident(arg) {
+            self.emit_mov_imm64(RAX, SYS_WRITE);
+            self.emit_mov_imm64(RDI, FD_STDOUT);
+            self.emit_mov_imm64_reloc(RSI, offset);
+            self.emit_mov_imm64(RDX, len);
+            self.emit_syscall();
         } else {
             self.emit_expr(arg);
             self.emit_print_rax_int();
+        }
+    }
+
+    fn try_resolve_str_ident(&self, arg: &Expr) -> Option<(u64, u64)> {
+        match arg {
+            Expr::Ident(name) => {
+                let sym = self.lookup_symbol(name);
+                if let TypeExpr::Str(n) = &sym.ty {
+                    return Some((sym.offset_in_data, *n as u64));
+                }
+                None
+            }
+            Expr::FieldAccess { base, field } => {
+                let base_name = match base.as_ref() {
+                    Expr::Ident(n) => n,
+                    _ => return None,
+                };
+                let sym = self.lookup_symbol(base_name);
+                if let TypeExpr::Record(rname) = &sym.ty {
+                    let info = self.record_types.get(rname)?;
+                    let f = info.fields.iter().find(|f| f.name == *field)?;
+                    if let TypeExpr::Str(n) = &f.ty {
+                        return Some((sym.offset_in_data + f.offset, *n as u64));
+                    }
+                }
+                None
+            }
+            _ => None,
         }
     }
 
@@ -316,6 +463,29 @@ impl Codegen {
                 self.emit_test_rax_rax();
                 self.emit_setcc_dl_eq_zero();
                 self.emit_movzx_eax_dl();
+            }
+            Expr::FieldAccess { base, field } => {
+                let base_name = match base.as_ref() {
+                    Expr::Ident(name) => name,
+                    _ => panic!("codegen: only single-level field access supported"),
+                };
+                let sym = self.lookup_symbol(base_name);
+                let base_offset = sym.offset_in_data;
+                let record_name = match &sym.ty {
+                    TypeExpr::Record(rname) => rname.clone(),
+                    _ => panic!("codegen: `{}` is not a record", base_name),
+                };
+                let info = self.record_types.get(&record_name).unwrap();
+                let f = info
+                    .fields
+                    .iter()
+                    .find(|f| f.name == *field)
+                    .unwrap_or_else(|| {
+                        panic!("codegen: no field `{}` in record `{}`", field, record_name)
+                    });
+                let total_offset = base_offset + f.offset;
+                self.emit_mov_imm64_reloc(RBX, total_offset);
+                self.emit_mov_rax_from_rbx();
             }
             Expr::StringLit(_) => {
                 panic!("codegen: string literals cannot appear in runtime expressions");
@@ -560,6 +730,14 @@ impl Codegen {
     }
 }
 
+fn type_size(ty: &TypeExpr) -> u64 {
+    match ty {
+        TypeExpr::UInt(_) => 8,
+        TypeExpr::Str(n) => *n as u64,
+        TypeExpr::Record(_) => panic!("codegen: nested record fields not supported yet"),
+    }
+}
+
 enum ConstValue {
     Str(String),
     Int(i64),
@@ -582,7 +760,10 @@ fn try_eval_const(expr: &Expr) -> Option<ConstValue> {
     match expr {
         Expr::StringLit(s) => Some(ConstValue::Str(s.clone())),
         Expr::IntLit(n) => Some(ConstValue::Int(*n)),
-        Expr::Ident(_) | Expr::Compare { .. } | Expr::Not { .. } => None,
+        Expr::Ident(_)
+        | Expr::Compare { .. }
+        | Expr::Not { .. }
+        | Expr::FieldAccess { .. } => None,
         Expr::BinaryOp { op, left, right } => {
             let l = match try_eval_const(left)? {
                 ConstValue::Int(n) => n,

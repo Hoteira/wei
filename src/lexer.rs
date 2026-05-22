@@ -19,6 +19,7 @@ pub enum Token {
     GtEq,
     Bang,
     Colon,
+    Dot,
     DotDot,
     Indent,
     Dedent,
@@ -148,6 +149,10 @@ pub fn lex(source: &str) -> Vec<Token> {
                 b'.' if i + 1 < bytes.len() && bytes[i + 1] == b'.' => {
                     tokens.push(Token::DotDot);
                     i += 2;
+                }
+                b'.' => {
+                    tokens.push(Token::Dot);
+                    i += 1;
                 }
                 b'"' => {
                     i += 1; // opening quote

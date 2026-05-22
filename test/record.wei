@@ -1,0 +1,14 @@
+type Point:
+    x uint(3)
+    y uint(3)
+
+let p Point
+let sum uint(3) = 0
+
+par main:
+    p.x = 10
+    p.y = 7
+    sum = p.x + p.y
+    print(sum)
+
+main()
