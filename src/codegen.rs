@@ -1,4 +1,4 @@
-use crate::ast::{BinOp, Expr, Program, Stmt};
+use crate::ast::{BinOp, CmpOp, Expr, Program, Stmt};
 use crate::elf::ENTRY_VMA;
 
 const RAX: u8 = 0;
@@ -137,6 +137,7 @@ impl Codegen {
             Stmt::For {
                 var, start, end, body,
             } => self.emit_for(var, start, end, body),
+            Stmt::While { cond, body } => self.emit_while(cond, body),
             Stmt::Call { name, args } => {
                 if name == "print" {
                     if args.len() != 1 {
@@ -153,6 +154,22 @@ impl Codegen {
                 }
             }
         }
+    }
+
+    fn emit_while(&mut self, cond: &Expr, body: &[Stmt]) {
+        let loop_start = self.code.len();
+        self.emit_expr(cond);
+        self.emit_test_rax_rax();
+        let jz_pos = self.emit_jz_placeholder();
+
+        for s in body {
+            self.emit_stmt(s);
+        }
+
+        self.emit_jmp_back_to(loop_start);
+
+        let loop_end = self.code.len();
+        self.patch_rel32(jz_pos, loop_end);
     }
 
     fn emit_for(&mut self, var: &str, start: &Expr, end: &Expr, body: &[Stmt]) {
@@ -283,6 +300,22 @@ impl Codegen {
                         self.emit_mov_rax_rdx();
                     }
                 }
+            }
+            Expr::Compare { op, left, right } => {
+                self.emit_expr(left);
+                self.emit_push_rax();
+                self.emit_expr(right);
+                self.emit_mov_rbx_rax();
+                self.emit_pop_rax();
+                self.emit_cmp_rax_rbx();
+                self.emit_setcc_dl(*op);
+                self.emit_movzx_eax_dl();
+            }
+            Expr::Not { inner } => {
+                self.emit_expr(inner);
+                self.emit_test_rax_rax();
+                self.emit_setcc_dl_eq_zero();
+                self.emit_movzx_eax_dl();
             }
             Expr::StringLit(_) => {
                 panic!("codegen: string literals cannot appear in runtime expressions");
@@ -458,6 +491,38 @@ impl Codegen {
         pos
     }
 
+    fn emit_jz_placeholder(&mut self) -> usize {
+        // jz rel32: 0F 84 + 4-byte placeholder
+        self.code.push(0x0F);
+        self.code.push(0x84);
+        let pos = self.code.len();
+        self.code.extend_from_slice(&[0u8; 4]);
+        pos
+    }
+
+    fn emit_setcc_dl(&mut self, op: CmpOp) {
+        // setcc r/m8: 0F 9X + ModRM (mod=11 reg=000 rm=010 → dl) = C2
+        let opcode = match op {
+            CmpOp::Eq => 0x94,
+            CmpOp::Ne => 0x95,
+            CmpOp::Lt => 0x9C, // signed less
+            CmpOp::Le => 0x9E,
+            CmpOp::Gt => 0x9F,
+            CmpOp::Ge => 0x9D,
+        };
+        self.code.extend_from_slice(&[0x0F, opcode, 0xC2]);
+    }
+
+    fn emit_setcc_dl_eq_zero(&mut self) {
+        // sete dl — used to materialize "not x" after `test rax, rax`
+        self.code.extend_from_slice(&[0x0F, 0x94, 0xC2]);
+    }
+
+    fn emit_movzx_eax_dl(&mut self) {
+        // movzx eax, dl — zero-extend dl into rax (writing eax clears upper 32 bits)
+        self.code.extend_from_slice(&[0x0F, 0xB6, 0xC2]);
+    }
+
     fn emit_jmp_back_to(&mut self, target: usize) {
         // jmp rel32
         self.code.push(0xE9);
@@ -517,7 +582,7 @@ fn try_eval_const(expr: &Expr) -> Option<ConstValue> {
     match expr {
         Expr::StringLit(s) => Some(ConstValue::Str(s.clone())),
         Expr::IntLit(n) => Some(ConstValue::Int(*n)),
-        Expr::Ident(_) => None,
+        Expr::Ident(_) | Expr::Compare { .. } | Expr::Not { .. } => None,
         Expr::BinaryOp { op, left, right } => {
             let l = match try_eval_const(left)? {
                 ConstValue::Int(n) => n,

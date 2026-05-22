@@ -1,4 +1,4 @@
-use crate::ast::{BinOp, Expr, Program, Stmt, TypeExpr};
+use crate::ast::{BinOp, CmpOp, Expr, Program, Stmt, TypeExpr};
 use crate::lexer::Token;
 
 pub fn parse(tokens: &[Token]) -> Program {
@@ -45,11 +45,29 @@ impl<'a> Parser<'a> {
             if name == "for" {
                 return self.parse_for();
             }
+            if name == "while" {
+                return self.parse_while();
+            }
             if matches!(self.tokens.get(self.pos + 1), Some(Token::Eq)) {
                 return self.parse_assign();
             }
         }
         self.parse_call()
+    }
+
+    fn parse_while(&mut self) -> Stmt {
+        self.pos += 1; // consume "while"
+        let cond = self.parse_expr();
+        self.expect_colon();
+        self.skip_newlines();
+        self.expect_indent();
+        let mut body = Vec::new();
+        while !matches!(self.peek(), Token::Dedent | Token::Eof) {
+            body.push(self.parse_statement());
+            self.skip_newlines();
+        }
+        self.expect_dedent();
+        Stmt::While { cond, body }
     }
 
     fn parse_for(&mut self) -> Stmt {
@@ -140,6 +158,20 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr(&mut self) -> Expr {
+        let left = self.parse_additive();
+        if let Some(op) = self.peek_cmp_op() {
+            self.pos += 1;
+            let right = self.parse_additive();
+            return Expr::Compare {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        left
+    }
+
+    fn parse_additive(&mut self) -> Expr {
         let mut left = self.parse_term();
         while let Some(op) = self.peek_add_op() {
             self.pos += 1;
@@ -154,10 +186,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_term(&mut self) -> Expr {
-        let mut left = self.parse_atom();
+        let mut left = self.parse_unary();
         while let Some(op) = self.peek_mul_op() {
             self.pos += 1;
-            let right = self.parse_atom();
+            let right = self.parse_unary();
             left = Expr::BinaryOp {
                 op,
                 left: Box::new(left),
@@ -165,6 +197,17 @@ impl<'a> Parser<'a> {
             };
         }
         left
+    }
+
+    fn parse_unary(&mut self) -> Expr {
+        if matches!(self.peek(), Token::Bang) {
+            self.pos += 1;
+            let inner = self.parse_unary();
+            return Expr::Not {
+                inner: Box::new(inner),
+            };
+        }
+        self.parse_atom()
     }
 
     fn parse_atom(&mut self) -> Expr {
@@ -196,6 +239,18 @@ impl<'a> Parser<'a> {
             Token::Star => Some(BinOp::Mul),
             Token::Slash => Some(BinOp::Div),
             Token::Percent => Some(BinOp::Mod),
+            _ => None,
+        }
+    }
+
+    fn peek_cmp_op(&self) -> Option<CmpOp> {
+        match self.peek() {
+            Token::EqEq => Some(CmpOp::Eq),
+            Token::BangEq => Some(CmpOp::Ne),
+            Token::Lt => Some(CmpOp::Lt),
+            Token::LtEq => Some(CmpOp::Le),
+            Token::Gt => Some(CmpOp::Gt),
+            Token::GtEq => Some(CmpOp::Ge),
             _ => None,
         }
     }

@@ -24,6 +24,10 @@ pub enum Stmt {
         end: Expr,
         body: Vec<Stmt>,
     },
+    While {
+        cond: Expr,
+        body: Vec<Stmt>,
+    },
     Call {
         name: String,
         args: Vec<Expr>,
@@ -44,6 +48,16 @@ pub enum BinOp {
     Mod,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
 #[derive(Debug)]
 pub enum Expr {
     StringLit(String),
@@ -53,5 +67,13 @@ pub enum Expr {
         op: BinOp,
         left: Box<Expr>,
         right: Box<Expr>,
+    },
+    Compare {
+        op: CmpOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Not {
+        inner: Box<Expr>,
     },
 }

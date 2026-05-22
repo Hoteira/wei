@@ -11,6 +11,13 @@ pub enum Token {
     Slash,
     Percent,
     Eq,
+    EqEq,
+    BangEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+    Bang,
     Colon,
     DotDot,
     Indent,
@@ -102,8 +109,36 @@ pub fn lex(source: &str) -> Vec<Token> {
                     tokens.push(Token::Percent);
                     i += 1;
                 }
+                b'=' if i + 1 < bytes.len() && bytes[i + 1] == b'=' => {
+                    tokens.push(Token::EqEq);
+                    i += 2;
+                }
                 b'=' => {
                     tokens.push(Token::Eq);
+                    i += 1;
+                }
+                b'!' if i + 1 < bytes.len() && bytes[i + 1] == b'=' => {
+                    tokens.push(Token::BangEq);
+                    i += 2;
+                }
+                b'!' => {
+                    tokens.push(Token::Bang);
+                    i += 1;
+                }
+                b'<' if i + 1 < bytes.len() && bytes[i + 1] == b'=' => {
+                    tokens.push(Token::LtEq);
+                    i += 2;
+                }
+                b'<' => {
+                    tokens.push(Token::Lt);
+                    i += 1;
+                }
+                b'>' if i + 1 < bytes.len() && bytes[i + 1] == b'=' => {
+                    tokens.push(Token::GtEq);
+                    i += 2;
+                }
+                b'>' => {
+                    tokens.push(Token::Gt);
                     i += 1;
                 }
                 b':' => {

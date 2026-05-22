@@ -50,6 +50,9 @@ impl Checker {
             Stmt::Par { body, .. } => {
                 self.check_block(body);
             }
+            Stmt::While { body, .. } => {
+                self.check_block(body);
+            }
             Stmt::For { var, body, .. } => {
                 if self.symbols.contains_key(var) {
                     self.errors.push(format!(
@@ -96,7 +99,7 @@ impl Checker {
 fn try_const_int(expr: &Expr) -> Option<i64> {
     match expr {
         Expr::IntLit(n) => Some(*n),
-        Expr::Ident(_) | Expr::StringLit(_) => None,
+        Expr::Ident(_) | Expr::StringLit(_) | Expr::Compare { .. } | Expr::Not { .. } => None,
         Expr::BinaryOp { op, left, right } => {
             let l = try_const_int(left)?;
             let r = try_const_int(right)?;

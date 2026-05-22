@@ -1,0 +1,8 @@
+let n uint(3) = 0
+
+par main:
+    while !(n == 7):
+        n = n + 1
+    print(n)
+
+main()
