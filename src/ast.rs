@@ -18,6 +18,12 @@ pub enum Stmt {
         name: String,
         body: Vec<Stmt>,
     },
+    For {
+        var: String,
+        start: Expr,
+        end: Expr,
+        body: Vec<Stmt>,
+    },
     Call {
         name: String,
         args: Vec<Expr>,

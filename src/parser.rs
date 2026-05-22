@@ -42,11 +42,41 @@ impl<'a> Parser<'a> {
             if name == "par" {
                 return self.parse_par();
             }
+            if name == "for" {
+                return self.parse_for();
+            }
             if matches!(self.tokens.get(self.pos + 1), Some(Token::Eq)) {
                 return self.parse_assign();
             }
         }
         self.parse_call()
+    }
+
+    fn parse_for(&mut self) -> Stmt {
+        self.pos += 1; // consume "for"
+        let var = self.expect_ident();
+        let in_kw = self.expect_ident();
+        if in_kw != "in" {
+            panic!("parse error: expected 'in' after for variable, got '{}'", in_kw);
+        }
+        let start = self.parse_expr();
+        self.expect_dotdot();
+        let end = self.parse_expr();
+        self.expect_colon();
+        self.skip_newlines();
+        self.expect_indent();
+        let mut body = Vec::new();
+        while !matches!(self.peek(), Token::Dedent | Token::Eof) {
+            body.push(self.parse_statement());
+            self.skip_newlines();
+        }
+        self.expect_dedent();
+        Stmt::For {
+            var,
+            start,
+            end,
+            body,
+        }
     }
 
     fn parse_par(&mut self) -> Stmt {
@@ -224,6 +254,14 @@ impl<'a> Parser<'a> {
         self.pos += 1;
         if !matches!(t, Token::Dedent) {
             panic!("parse error: expected dedent, got {:?}", t);
+        }
+    }
+
+    fn expect_dotdot(&mut self) {
+        let t = self.tokens[self.pos].clone();
+        self.pos += 1;
+        if !matches!(t, Token::DotDot) {
+            panic!("parse error: expected '..', got {:?}", t);
         }
     }
 }

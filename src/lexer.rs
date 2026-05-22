@@ -12,6 +12,7 @@ pub enum Token {
     Percent,
     Eq,
     Colon,
+    DotDot,
     Indent,
     Dedent,
     Newline,
@@ -108,6 +109,10 @@ pub fn lex(source: &str) -> Vec<Token> {
                 b':' => {
                     tokens.push(Token::Colon);
                     i += 1;
+                }
+                b'.' if i + 1 < bytes.len() && bytes[i + 1] == b'.' => {
+                    tokens.push(Token::DotDot);
+                    i += 2;
                 }
                 b'"' => {
                     i += 1; // opening quote

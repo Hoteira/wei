@@ -134,6 +134,9 @@ impl Codegen {
         match stmt {
             Stmt::Let { .. } | Stmt::Par { .. } => {}
             Stmt::Assign { name, value } => self.emit_assign(name, value),
+            Stmt::For {
+                var, start, end, body,
+            } => self.emit_for(var, start, end, body),
             Stmt::Call { name, args } => {
                 if name == "print" {
                     if args.len() != 1 {
@@ -150,6 +153,50 @@ impl Codegen {
                 }
             }
         }
+    }
+
+    fn emit_for(&mut self, var: &str, start: &Expr, end: &Expr, body: &[Stmt]) {
+        if self.symbols.iter().any(|s| s.name == var) {
+            panic!("codegen: loop variable `{}` shadows existing symbol", var);
+        }
+        let var_offset = self.data.len() as u64;
+        self.data.extend_from_slice(&[0u8; 8]);
+        self.symbols.push(Symbol {
+            name: var.to_string(),
+            offset_in_data: var_offset,
+        });
+
+        self.emit_expr(start);
+        self.emit_mov_imm64_reloc(RBX, var_offset);
+        self.emit_mov_at_rbx_rax();
+
+        self.emit_expr(end);
+        self.emit_push_rax();
+
+        let loop_start = self.code.len();
+        self.emit_mov_imm64_reloc(RBX, var_offset);
+        self.emit_mov_rax_from_rbx();
+        self.emit_mov_rbx_from_rsp_off(0);
+        self.emit_cmp_rax_rbx();
+        let jge_pos = self.emit_jge_placeholder();
+
+        for s in body {
+            self.emit_stmt(s);
+        }
+
+        self.emit_mov_imm64_reloc(RBX, var_offset);
+        self.emit_mov_rax_from_rbx();
+        self.emit_inc_rax();
+        self.emit_mov_at_rbx_rax();
+
+        self.emit_jmp_back_to(loop_start);
+
+        let loop_end = self.code.len();
+        self.patch_rel32(jge_pos, loop_end);
+
+        self.emit_add_rsp_imm8(8);
+
+        self.symbols.pop();
     }
 
     fn emit_assign(&mut self, name: &str, value: &Expr) {
@@ -380,6 +427,58 @@ impl Codegen {
     fn emit_sub_rdx_rsi(&mut self) {
         // sub rdx, rsi
         self.code.extend_from_slice(&[0x48, 0x29, 0xF2]);
+    }
+
+    fn emit_mov_rbx_from_rsp_off(&mut self, disp: i8) {
+        // mov rbx, [rsp+disp8]
+        self.code.extend_from_slice(&[0x48, 0x8B, 0x5C, 0x24, disp as u8]);
+    }
+
+    fn emit_cmp_rax_rbx(&mut self) {
+        // cmp rax, rbx
+        self.code.extend_from_slice(&[0x48, 0x39, 0xD8]);
+    }
+
+    fn emit_inc_rax(&mut self) {
+        // inc rax
+        self.code.extend_from_slice(&[0x48, 0xFF, 0xC0]);
+    }
+
+    fn emit_add_rsp_imm8(&mut self, imm: i8) {
+        // add rsp, imm8 (sign-extended)
+        self.code.extend_from_slice(&[0x48, 0x83, 0xC4, imm as u8]);
+    }
+
+    fn emit_jge_placeholder(&mut self) -> usize {
+        // jge rel32: 0F 8D + 4-byte placeholder; returns position of rel32 field
+        self.code.push(0x0F);
+        self.code.push(0x8D);
+        let pos = self.code.len();
+        self.code.extend_from_slice(&[0u8; 4]);
+        pos
+    }
+
+    fn emit_jmp_back_to(&mut self, target: usize) {
+        // jmp rel32
+        self.code.push(0xE9);
+        let pos = self.code.len();
+        let rel = target as i64 - (pos + 4) as i64;
+        assert!(
+            (i32::MIN as i64..=i32::MAX as i64).contains(&rel),
+            "jmp rel32 displacement {} out of range",
+            rel
+        );
+        self.code.extend_from_slice(&(rel as i32).to_le_bytes());
+    }
+
+    fn patch_rel32(&mut self, pos: usize, target: usize) {
+        let rel = target as i64 - (pos + 4) as i64;
+        assert!(
+            (i32::MIN as i64..=i32::MAX as i64).contains(&rel),
+            "rel32 displacement {} out of range",
+            rel
+        );
+        self.code[pos..pos + 4].copy_from_slice(&(rel as i32).to_le_bytes());
     }
 
     fn emit_jnz_back_to(&mut self, target: usize) {
