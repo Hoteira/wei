@@ -182,6 +182,14 @@ impl Codegen {
                     (TypeExpr::Str(n), None) => {
                         self.data.extend_from_slice(&vec![b' '; *n as usize]);
                     }
+                    (TypeExpr::UDec(_, m), Some(init_expr))
+                    | (TypeExpr::IDec(_, m), Some(init_expr)) => {
+                        let scaled = decimal_init_value(init_expr, *m);
+                        self.data.extend_from_slice(&(scaled as u64).to_le_bytes());
+                    }
+                    (TypeExpr::UDec(_, _), None) | (TypeExpr::IDec(_, _), None) => {
+                        self.data.extend_from_slice(&[0u8; 8]);
+                    }
                     (TypeExpr::Record(rname), _) => {
                         let info = self.record_types.get(rname).unwrap_or_else(|| {
                             panic!("codegen: undefined record type `{}`", rname)
@@ -349,9 +357,40 @@ impl Codegen {
             self.emit_mov_imm64_reloc(RSI, offset);
             self.emit_mov_imm64(RDX, len);
             self.emit_syscall();
+        } else if let Some(scale) = self.try_resolve_decimal_ident(arg) {
+            self.emit_expr(arg);
+            self.emit_print_rax_decimal(scale);
         } else {
             self.emit_expr(arg);
             self.emit_print_rax_int();
+        }
+    }
+
+    fn try_resolve_decimal_ident(&self, arg: &Expr) -> Option<u32> {
+        match arg {
+            Expr::Ident(name) => {
+                let sym = self.lookup_symbol(name);
+                match &sym.ty {
+                    TypeExpr::UDec(_, m) | TypeExpr::IDec(_, m) => Some(*m),
+                    _ => None,
+                }
+            }
+            Expr::FieldAccess { base, field } => {
+                let base_name = match base.as_ref() {
+                    Expr::Ident(n) => n,
+                    _ => return None,
+                };
+                let sym = self.lookup_symbol(base_name);
+                if let TypeExpr::Record(rname) = &sym.ty {
+                    let info = self.record_types.get(rname)?;
+                    let f = info.fields.iter().find(|f| f.name == *field)?;
+                    if let TypeExpr::UDec(_, m) | TypeExpr::IDec(_, m) = &f.ty {
+                        return Some(*m);
+                    }
+                }
+                None
+            }
+            _ => None,
         }
     }
 
@@ -396,6 +435,40 @@ impl Codegen {
         self.emit_syscall();
     }
 
+    fn emit_print_rax_decimal(&mut self, scale: u32) {
+        self.emit_mov_imm64_reloc(RSI, SCRATCH_END);
+        self.emit_mov_imm64(RCX, 10);
+        self.emit_mov_imm64(RDI, 0);
+
+        let loop_start = self.code.len();
+
+        self.emit_cmp_rdi_imm8(scale as u8);
+        let jne_pos = self.emit_jne_placeholder();
+        self.emit_dec_rsi();
+        self.emit_mov_byte_at_rsi_imm(b'.');
+        let skip_dot = self.code.len();
+        self.patch_rel32(jne_pos, skip_dot);
+
+        self.emit_xor_rdx_rdx();
+        self.emit_div_rcx();
+        self.emit_add_rdx_imm8(0x30);
+        self.emit_dec_rsi();
+        self.emit_mov_at_rsi_dl();
+        self.emit_inc_rdi();
+
+        self.emit_test_rax_rax();
+        self.emit_jnz_rel32_back_to(loop_start);
+        self.emit_cmp_rdi_imm8(scale as u8);
+        self.emit_jle_rel32_back_to(loop_start);
+
+        self.emit_mov_imm64_reloc(RDX, SCRATCH_END);
+        self.emit_sub_rdx_rsi();
+
+        self.emit_mov_imm64(RAX, SYS_WRITE);
+        self.emit_mov_imm64(RDI, FD_STDOUT);
+        self.emit_syscall();
+    }
+
     fn emit_print_rax_int(&mut self) {
         self.emit_mov_imm64_reloc(RSI, SCRATCH_END);
         self.emit_mov_imm64(RCX, 10);
@@ -421,6 +494,9 @@ impl Codegen {
         match expr {
             Expr::IntLit(n) => {
                 self.emit_mov_imm64(RAX, *n as u64);
+            }
+            Expr::DecLit { scaled, .. } => {
+                self.emit_mov_imm64(RAX, *scaled as u64);
             }
             Expr::Ident(name) => {
                 let offset = self.lookup_symbol(name).offset_in_data;
@@ -661,6 +737,58 @@ impl Codegen {
         pos
     }
 
+    fn emit_jne_placeholder(&mut self) -> usize {
+        // jne rel32: 0F 85 + 4-byte placeholder
+        self.code.push(0x0F);
+        self.code.push(0x85);
+        let pos = self.code.len();
+        self.code.extend_from_slice(&[0u8; 4]);
+        pos
+    }
+
+    fn emit_jnz_rel32_back_to(&mut self, target: usize) {
+        // jnz rel32: 0F 85 + rel32
+        self.code.push(0x0F);
+        self.code.push(0x85);
+        let pos = self.code.len();
+        let rel = target as i64 - (pos + 4) as i64;
+        assert!(
+            (i32::MIN as i64..=i32::MAX as i64).contains(&rel),
+            "jnz rel32 displacement {} out of range",
+            rel
+        );
+        self.code.extend_from_slice(&(rel as i32).to_le_bytes());
+    }
+
+    fn emit_jle_rel32_back_to(&mut self, target: usize) {
+        // jle rel32: 0F 8E + rel32
+        self.code.push(0x0F);
+        self.code.push(0x8E);
+        let pos = self.code.len();
+        let rel = target as i64 - (pos + 4) as i64;
+        assert!(
+            (i32::MIN as i64..=i32::MAX as i64).contains(&rel),
+            "jle rel32 displacement {} out of range",
+            rel
+        );
+        self.code.extend_from_slice(&(rel as i32).to_le_bytes());
+    }
+
+    fn emit_cmp_rdi_imm8(&mut self, imm: u8) {
+        // cmp rdi, imm8 (sign-extended)
+        self.code.extend_from_slice(&[0x48, 0x83, 0xFF, imm]);
+    }
+
+    fn emit_inc_rdi(&mut self) {
+        // inc rdi
+        self.code.extend_from_slice(&[0x48, 0xFF, 0xC7]);
+    }
+
+    fn emit_mov_byte_at_rsi_imm(&mut self, imm: u8) {
+        // mov byte ptr [rsi], imm8
+        self.code.extend_from_slice(&[0xC6, 0x06, imm]);
+    }
+
     fn emit_jz_placeholder(&mut self) -> usize {
         // jz rel32: 0F 84 + 4-byte placeholder
         self.code.push(0x0F);
@@ -734,6 +862,7 @@ fn type_size(ty: &TypeExpr) -> u64 {
     match ty {
         TypeExpr::UInt(_) => 8,
         TypeExpr::Str(n) => *n as u64,
+        TypeExpr::UDec(_, _) | TypeExpr::IDec(_, _) => 8,
         TypeExpr::Record(_) => panic!("codegen: nested record fields not supported yet"),
     }
 }
@@ -756,11 +885,32 @@ fn eval_const(expr: &Expr) -> ConstValue {
     try_eval_const(expr).unwrap_or_else(|| panic!("codegen: expression is not a constant"))
 }
 
+fn decimal_init_value(init: &Expr, declared_m: u32) -> i64 {
+    match init {
+        Expr::IntLit(v) => {
+            let scale_factor = 10i64.checked_pow(declared_m).expect("scale too large");
+            v.checked_mul(scale_factor)
+                .expect("integer literal overflows declared decimal range")
+        }
+        Expr::DecLit { scaled, scale } => {
+            if *scale != declared_m {
+                panic!(
+                    "codegen: decimal literal scale {} doesn't match declared scale {}",
+                    scale, declared_m
+                );
+            }
+            *scaled
+        }
+        _ => panic!("codegen: decimal initializer must be a literal"),
+    }
+}
+
 fn try_eval_const(expr: &Expr) -> Option<ConstValue> {
     match expr {
         Expr::StringLit(s) => Some(ConstValue::Str(s.clone())),
         Expr::IntLit(n) => Some(ConstValue::Int(*n)),
-        Expr::Ident(_)
+        Expr::DecLit { .. }
+        | Expr::Ident(_)
         | Expr::Compare { .. }
         | Expr::Not { .. }
         | Expr::FieldAccess { .. } => None,

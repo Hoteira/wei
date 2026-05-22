@@ -3,8 +3,10 @@ pub enum Token {
     Ident(String),
     StringLit(String),
     IntLit(i64),
+    DecLit(i64, u32),
     LParen,
     RParen,
+    Comma,
     Plus,
     Minus,
     Star,
@@ -83,6 +85,10 @@ pub fn lex(source: &str) -> Vec<Token> {
                 }
                 b')' => {
                     tokens.push(Token::RParen);
+                    i += 1;
+                }
+                b',' => {
+                    tokens.push(Token::Comma);
                     i += 1;
                 }
                 b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
@@ -186,12 +192,42 @@ pub fn lex(source: &str) -> Vec<Token> {
                     while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'_') {
                         i += 1;
                     }
-                    let raw = std::str::from_utf8(&bytes[start..i]).unwrap();
-                    let cleaned: String = raw.chars().filter(|&c| c != '_').collect();
-                    let value: i64 = cleaned
-                        .parse()
-                        .unwrap_or_else(|_| panic!("lex error: invalid integer literal {:?}", raw));
-                    tokens.push(Token::IntLit(value));
+                    let int_end = i;
+                    if i + 1 < bytes.len()
+                        && bytes[i] == b'.'
+                        && bytes[i + 1].is_ascii_digit()
+                    {
+                        i += 1; // consume '.'
+                        let frac_start = i;
+                        while i < bytes.len()
+                            && (bytes[i].is_ascii_digit() || bytes[i] == b'_')
+                        {
+                            i += 1;
+                        }
+                        let int_str: String = bytes[start..int_end]
+                            .iter()
+                            .filter(|&&b| b != b'_')
+                            .map(|&b| b as char)
+                            .collect();
+                        let frac_str: String = bytes[frac_start..i]
+                            .iter()
+                            .filter(|&&b| b != b'_')
+                            .map(|&b| b as char)
+                            .collect();
+                        let scale = frac_str.len() as u32;
+                        let combined = format!("{}{}", int_str, frac_str);
+                        let value: i64 = combined.parse().unwrap_or_else(|_| {
+                            panic!("lex error: invalid decimal literal")
+                        });
+                        tokens.push(Token::DecLit(value, scale));
+                    } else {
+                        let raw = std::str::from_utf8(&bytes[start..i]).unwrap();
+                        let cleaned: String = raw.chars().filter(|&c| c != '_').collect();
+                        let value: i64 = cleaned.parse().unwrap_or_else(|_| {
+                            panic!("lex error: invalid integer literal {:?}", raw)
+                        });
+                        tokens.push(Token::IntLit(value));
+                    }
                 }
                 _ => {
                     panic!(

@@ -1,0 +1,8 @@
+let total udec(7,2) = 0
+
+par main:
+    total = total + 100.00
+    total = total + 25.50
+    print(total)
+
+main()

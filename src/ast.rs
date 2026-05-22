@@ -48,6 +48,8 @@ pub enum LValue {
 pub enum TypeExpr {
     UInt(u32),
     Str(u32),
+    UDec(u32, u32),
+    IDec(u32, u32),
     Record(String),
 }
 
@@ -74,6 +76,7 @@ pub enum CmpOp {
 pub enum Expr {
     StringLit(String),
     IntLit(i64),
+    DecLit { scaled: i64, scale: u32 },
     Ident(String),
     BinaryOp {
         op: BinOp,

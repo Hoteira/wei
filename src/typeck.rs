@@ -66,6 +66,13 @@ impl Checker {
                         ));
                     }
                 }
+                if let (
+                    TypeExpr::UDec(big_n, m) | TypeExpr::IDec(big_n, m),
+                    Some(init_expr),
+                ) = (ty, init)
+                {
+                    self.check_decimal_init(init_expr, *big_n, *m, name);
+                }
                 self.symbols.insert(name.clone(), ty.clone());
             }
             Stmt::Assign { target, value } => {
@@ -75,6 +82,16 @@ impl Checker {
                         self.errors.push(format!(
                             "runtime assignment to str(N) is not yet supported (only let-init)"
                         ));
+                    }
+                    if let TypeExpr::UDec(_, m) | TypeExpr::IDec(_, m) = t {
+                        if let Expr::DecLit { scale, .. } = value {
+                            if *scale != *m {
+                                self.errors.push(format!(
+                                    "assignment: decimal literal scale {} doesn't match target scale {}",
+                                    scale, m
+                                ));
+                            }
+                        }
                     }
                 }
                 if let Some(t) = target_ty {
@@ -160,10 +177,54 @@ impl Checker {
                     ));
                 }
             }
+            TypeExpr::UDec(_, _) | TypeExpr::IDec(_, _) => {
+                self.errors.push(format!(
+                    "{}: cannot assign a bare integer to a decimal at runtime — use a decimal literal",
+                    context
+                ));
+            }
             TypeExpr::Str(_) | TypeExpr::Record(_) => {
                 self.errors
                     .push(format!("{}: cannot assign a number to this type", context));
             }
+        }
+    }
+
+    fn check_decimal_init(&mut self, init: &Expr, big_n: u32, m: u32, var_name: &str) {
+        let max_scaled = 10i64.checked_pow(big_n).map(|x| x - 1).unwrap_or(i64::MAX);
+        match init {
+            Expr::IntLit(v) => {
+                let scale_factor = 10i64.checked_pow(m).unwrap_or(i64::MAX);
+                let scaled = v.checked_mul(scale_factor);
+                match scaled {
+                    Some(s) if s >= 0 && s <= max_scaled => {}
+                    Some(s) => self.errors.push(format!(
+                        "initializer of `{}`: value {} (scaled {}) exceeds range for decimal({},{})",
+                        var_name, v, s, big_n, m
+                    )),
+                    None => self.errors.push(format!(
+                        "initializer of `{}`: value {} overflows when scaled to decimal({},{})",
+                        var_name, v, big_n, m
+                    )),
+                }
+            }
+            Expr::DecLit { scaled, scale } => {
+                if *scale != m {
+                    self.errors.push(format!(
+                        "initializer of `{}`: literal has scale {} but declared scale is {}",
+                        var_name, scale, m
+                    ));
+                } else if *scaled < 0 || *scaled > max_scaled {
+                    self.errors.push(format!(
+                        "initializer of `{}`: scaled value {} exceeds range for decimal({},{})",
+                        var_name, scaled, big_n, m
+                    ));
+                }
+            }
+            _ => self.errors.push(format!(
+                "initializer of `{}`: decimal init must be a literal",
+                var_name
+            )),
         }
     }
 }
@@ -171,7 +232,8 @@ impl Checker {
 fn try_const_int(expr: &Expr) -> Option<i64> {
     match expr {
         Expr::IntLit(n) => Some(*n),
-        Expr::Ident(_)
+        Expr::DecLit { .. }
+        | Expr::Ident(_)
         | Expr::StringLit(_)
         | Expr::Compare { .. }
         | Expr::Not { .. }

@@ -185,21 +185,35 @@ impl<'a> Parser<'a> {
         let name = self.expect_ident();
         if matches!(self.peek(), Token::LParen) {
             self.pos += 1;
-            let n = match self.tokens[self.pos].clone() {
-                Token::IntLit(n) => {
-                    self.pos += 1;
-                    n
+            let n = self.expect_intlit();
+            if matches!(self.peek(), Token::Comma) {
+                self.pos += 1;
+                let m = self.expect_intlit();
+                self.expect_rparen();
+                match name.as_str() {
+                    "udec" => TypeExpr::UDec(n as u32, m as u32),
+                    "idec" => TypeExpr::IDec(n as u32, m as u32),
+                    other => panic!("parse error: unknown 2-param type `{}`", other),
                 }
-                other => panic!("parse error: expected integer in type, got {:?}", other),
-            };
-            self.expect_rparen();
-            match name.as_str() {
-                "uint" => TypeExpr::UInt(n as u32),
-                "str" => TypeExpr::Str(n as u32),
-                other => panic!("parse error: unknown parameterized type `{}`", other),
+            } else {
+                self.expect_rparen();
+                match name.as_str() {
+                    "uint" => TypeExpr::UInt(n as u32),
+                    "str" => TypeExpr::Str(n as u32),
+                    other => panic!("parse error: unknown 1-param type `{}`", other),
+                }
             }
         } else {
             TypeExpr::Record(name)
+        }
+    }
+
+    fn expect_intlit(&mut self) -> i64 {
+        let t = self.tokens[self.pos].clone();
+        self.pos += 1;
+        match t {
+            Token::IntLit(n) => n,
+            other => panic!("parse error: expected integer, got {:?}", other),
         }
     }
 
@@ -287,6 +301,7 @@ impl<'a> Parser<'a> {
         match t {
             Token::StringLit(s) => Expr::StringLit(s),
             Token::IntLit(n) => Expr::IntLit(n),
+            Token::DecLit(v, s) => Expr::DecLit { scaled: v, scale: s },
             Token::Ident(n) => Expr::Ident(n),
             Token::LParen => {
                 let e = self.parse_expr();
