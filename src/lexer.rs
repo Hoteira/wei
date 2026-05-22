@@ -2,6 +2,7 @@
 pub enum Token {
     Ident(String),
     StringLit(String),
+    IntLit(i64),
     LParen,
     RParen,
     Newline,
@@ -60,6 +61,18 @@ pub fn lex(source: &str) -> Vec<Token> {
                     .expect("lex error: invalid UTF-8 in identifier")
                     .to_string();
                 tokens.push(Token::Ident(name));
+            }
+            c if c.is_ascii_digit() => {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let raw = std::str::from_utf8(&bytes[start..i]).unwrap();
+                let cleaned: String = raw.chars().filter(|&c| c != '_').collect();
+                let value: i64 = cleaned
+                    .parse()
+                    .unwrap_or_else(|_| panic!("lex error: invalid integer literal {:?}", raw));
+                tokens.push(Token::IntLit(value));
             }
             _ => {
                 panic!(

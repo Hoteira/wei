@@ -1,4 +1,3 @@
-
 use crate::ast::{Expr, Program, Stmt};
 use crate::elf::ENTRY_VMA;
 
@@ -13,16 +12,17 @@ const SYS_WRITE: u64 = 1;
 const SYS_EXIT: u64 = 60;
 const FD_STDOUT: u64 = 1;
 
-pub fn emit(program: &Program) -> Vec<u8> {`.
-    let string_literal: String = match program.statements.as_slice() {
+pub fn emit(program: &Program) -> Vec<u8> {
+    let to_print: String = match program.statements.as_slice() {
         [Stmt::Call { name, args }] if name == "print" => match args.as_slice() {
             [Expr::StringLit(s)] => s.clone(),
-            _ => panic!("codegen: print() expects a single string-literal argument"),
+            [Expr::IntLit(n)] => n.to_string(),
+            _ => panic!("codegen: print() expects one string or integer argument"),
         },
-        _ => panic!("codegen: v0.1 supports exactly one `print(\"...\")` statement"),
+        _ => panic!("codegen: only one `print(...)` statement supported"),
     };
 
-    let str_bytes = string_literal.into_bytes();
+    let str_bytes = to_print.into_bytes();
     let str_len = str_bytes.len() as u64;
 
     let mut code: Vec<u8> = Vec::new();
@@ -57,7 +57,6 @@ fn emit_mov_imm64(out: &mut Vec<u8>, reg: u8, imm: u64) {
     out.push(0xB8 + reg);
     out.extend_from_slice(&imm.to_le_bytes());
 }
-
 
 fn emit_syscall(out: &mut Vec<u8>) {
     out.push(0x0F);

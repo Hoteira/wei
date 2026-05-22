@@ -37,11 +37,21 @@ impl<'a> Parser<'a> {
     fn parse_statement(&mut self) -> Stmt {
         let name = self.expect_ident();
         self.expect_lparen();
-        let arg = self.expect_string_lit();
+        let arg = self.parse_expr();
         self.expect_rparen();
         Stmt::Call {
             name,
-            args: vec![Expr::StringLit(arg)],
+            args: vec![arg],
+        }
+    }
+
+    fn parse_expr(&mut self) -> Expr {
+        let t = self.tokens[self.pos].clone();
+        self.pos += 1;
+        match t {
+            Token::StringLit(s) => Expr::StringLit(s),
+            Token::IntLit(n) => Expr::IntLit(n),
+            other => panic!("parse error: expected expression, got {:?}", other),
         }
     }
 
@@ -51,15 +61,6 @@ impl<'a> Parser<'a> {
         match t {
             Token::Ident(n) => n,
             other => panic!("parse error: expected identifier, got {:?}", other),
-        }
-    }
-
-    fn expect_string_lit(&mut self) -> String {
-        let t = self.tokens[self.pos].clone();
-        self.pos += 1;
-        match t {
-            Token::StringLit(s) => s,
-            other => panic!("parse error: expected string literal, got {:?}", other),
         }
     }
 

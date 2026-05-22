@@ -11,4 +11,5 @@ pub enum Stmt {
 #[derive(Debug)]
 pub enum Expr {
     StringLit(String),
+    IntLit(i64),
 }
