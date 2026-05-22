@@ -36,6 +36,11 @@ pub enum Stmt {
         name: String,
         fields: Vec<(String, TypeExpr)>,
     },
+    FileDecl {
+        name: String,
+        path: String,
+        mode: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +56,7 @@ pub enum TypeExpr {
     UDec(u32, u32),
     IDec(u32, u32),
     Record(String),
+    File,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -94,5 +100,9 @@ pub enum Expr {
     FieldAccess {
         base: Box<Expr>,
         field: String,
+    },
+    Call {
+        name: String,
+        args: Vec<Expr>,
     },
 }

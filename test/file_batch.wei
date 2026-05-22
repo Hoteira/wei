@@ -1,0 +1,18 @@
+type Employee:
+    name str(20)
+    salary udec(7,2)
+
+file emp_file = "/tmp/employees.dat" sequential
+let emp Employee
+let total udec(9,2) = 0
+
+par main:
+    open(emp_file, input)
+    read(emp_file, emp)
+    while !at_end(emp_file):
+        total = total + emp.salary
+        read(emp_file, emp)
+    close(emp_file)
+    print(total)
+
+main()

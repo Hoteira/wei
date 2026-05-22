@@ -51,6 +51,9 @@ impl<'a> Parser<'a> {
             if name == "type" {
                 return self.parse_typedef();
             }
+            if name == "file" {
+                return self.parse_file_decl();
+            }
             if self.looks_like_assignment() {
                 return self.parse_assign();
             }
@@ -72,6 +75,15 @@ impl<'a> Parser<'a> {
             p += 1;
         }
         matches!(self.tokens.get(p), Some(Token::Eq))
+    }
+
+    fn parse_file_decl(&mut self) -> Stmt {
+        self.pos += 1; // consume "file"
+        let name = self.expect_ident();
+        self.expect_eq();
+        let path = self.expect_string_lit();
+        let mode = self.expect_ident();
+        Stmt::FileDecl { name, path, mode }
     }
 
     fn parse_typedef(&mut self) -> Stmt {
@@ -220,11 +232,14 @@ impl<'a> Parser<'a> {
     fn parse_call(&mut self) -> Stmt {
         let name = self.expect_ident();
         self.expect_lparen();
-        let args = if matches!(self.peek(), Token::RParen) {
-            Vec::new()
-        } else {
-            vec![self.parse_expr()]
-        };
+        let mut args = Vec::new();
+        if !matches!(self.peek(), Token::RParen) {
+            args.push(self.parse_expr());
+            while matches!(self.peek(), Token::Comma) {
+                self.pos += 1;
+                args.push(self.parse_expr());
+            }
+        }
         self.expect_rparen();
         Stmt::Call { name, args }
     }
@@ -302,13 +317,38 @@ impl<'a> Parser<'a> {
             Token::StringLit(s) => Expr::StringLit(s),
             Token::IntLit(n) => Expr::IntLit(n),
             Token::DecLit(v, s) => Expr::DecLit { scaled: v, scale: s },
-            Token::Ident(n) => Expr::Ident(n),
+            Token::Ident(n) => {
+                if matches!(self.peek(), Token::LParen) {
+                    self.pos += 1;
+                    let mut args = Vec::new();
+                    if !matches!(self.peek(), Token::RParen) {
+                        args.push(self.parse_expr());
+                        while matches!(self.peek(), Token::Comma) {
+                            self.pos += 1;
+                            args.push(self.parse_expr());
+                        }
+                    }
+                    self.expect_rparen();
+                    Expr::Call { name: n, args }
+                } else {
+                    Expr::Ident(n)
+                }
+            }
             Token::LParen => {
                 let e = self.parse_expr();
                 self.expect_rparen();
                 e
             }
             other => panic!("parse error: expected expression, got {:?}", other),
+        }
+    }
+
+    fn expect_string_lit(&mut self) -> String {
+        let t = self.tokens[self.pos].clone();
+        self.pos += 1;
+        match t {
+            Token::StringLit(s) => s,
+            other => panic!("parse error: expected string literal, got {:?}", other),
         }
     }
 

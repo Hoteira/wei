@@ -16,6 +16,15 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
                 c.records.insert(name.clone(), fields.clone());
             }
         }
+        if let Stmt::FileDecl { name, mode, .. } = stmt {
+            if mode != "sequential" {
+                c.errors.push(format!(
+                    "file `{}`: only `sequential` mode is supported in v0.3 (got `{}`)",
+                    name, mode
+                ));
+            }
+            c.symbols.insert(name.clone(), TypeExpr::File);
+        }
     }
 
     c.check_block(&program.statements);
@@ -120,6 +129,7 @@ impl Checker {
                 }
             }
             Stmt::Call { .. } => {}
+            Stmt::FileDecl { .. } => {}
         }
     }
 
@@ -183,7 +193,7 @@ impl Checker {
                     context
                 ));
             }
-            TypeExpr::Str(_) | TypeExpr::Record(_) => {
+            TypeExpr::Str(_) | TypeExpr::Record(_) | TypeExpr::File => {
                 self.errors
                     .push(format!("{}: cannot assign a number to this type", context));
             }
@@ -237,7 +247,8 @@ fn try_const_int(expr: &Expr) -> Option<i64> {
         | Expr::StringLit(_)
         | Expr::Compare { .. }
         | Expr::Not { .. }
-        | Expr::FieldAccess { .. } => None,
+        | Expr::FieldAccess { .. }
+        | Expr::Call { .. } => None,
         Expr::BinaryOp { op, left, right } => {
             let l = try_const_int(left)?;
             let r = try_const_int(right)?;

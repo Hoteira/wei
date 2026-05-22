@@ -20,10 +20,14 @@ pub fn emit(program: &Program) -> Vec<u8> {
     let mut g = Codegen::new();
     g.register_typedefs(program);
     g.collect_symbols(program);
+    g.collect_files(program);
     g.register_paragraphs(program);
 
     for stmt in &program.statements {
-        if !matches!(stmt, Stmt::Par { .. } | Stmt::TypeDef { .. }) {
+        if !matches!(
+            stmt,
+            Stmt::Par { .. } | Stmt::TypeDef { .. } | Stmt::FileDecl { .. }
+        ) {
             g.emit_stmt(stmt);
         }
     }
@@ -114,6 +118,141 @@ impl Codegen {
         }
     }
 
+    fn collect_files(&mut self, program: &Program) {
+        for stmt in &program.statements {
+            if let Stmt::FileDecl { name, path, .. } = stmt {
+                let offset = self.data.len() as u64;
+                // 8 bytes fd, 8 bytes eof_flag, then null-terminated path
+                self.data.extend_from_slice(&[0u8; 16]);
+                self.data.extend_from_slice(path.as_bytes());
+                self.data.push(0);
+                self.symbols.push(Symbol {
+                    name: name.clone(),
+                    offset_in_data: offset,
+                    ty: TypeExpr::File,
+                });
+            }
+        }
+    }
+
+    fn file_fd_offset(&self, name: &str) -> u64 {
+        let sym = self.lookup_symbol(name);
+        if !matches!(sym.ty, TypeExpr::File) {
+            panic!("codegen: `{}` is not a file", name);
+        }
+        sym.offset_in_data
+    }
+
+    fn file_eof_offset(&self, name: &str) -> u64 {
+        self.file_fd_offset(name) + 8
+    }
+
+    fn file_path_offset(&self, name: &str) -> u64 {
+        self.file_fd_offset(name) + 16
+    }
+
+    fn record_size_of(&self, name: &str) -> u64 {
+        let sym = self.lookup_symbol(name);
+        match &sym.ty {
+            TypeExpr::Record(rname) => self.record_types[rname].size,
+            other => panic!("codegen: `{}` is not a record (type: {:?})", name, other),
+        }
+    }
+
+    fn emit_file_open(&mut self, args: &[Expr]) {
+        if args.len() != 2 {
+            panic!("codegen: open() takes 2 args");
+        }
+        let file_name = match &args[0] {
+            Expr::Ident(n) => n.clone(),
+            _ => panic!("codegen: open() first arg must be a file ident"),
+        };
+        let mode_name = match &args[1] {
+            Expr::Ident(n) => n.clone(),
+            _ => panic!("codegen: open() second arg must be a mode keyword"),
+        };
+        let flags: u64 = match mode_name.as_str() {
+            "input" => 0,    // O_RDONLY
+            "output" => 577, // O_WRONLY | O_CREAT | O_TRUNC = 1 | 64 | 512
+            other => panic!("codegen: unknown file mode `{}`", other),
+        };
+        let path_off = self.file_path_offset(&file_name);
+        let fd_off = self.file_fd_offset(&file_name);
+
+        self.emit_mov_imm64(RAX, 2); // sys_open
+        self.emit_mov_imm64_reloc(RDI, path_off);
+        self.emit_mov_imm64(RSI, flags);
+        self.emit_mov_imm64(RDX, 0o644);
+        self.emit_syscall();
+        // store fd
+        self.emit_mov_imm64_reloc(RBX, fd_off);
+        self.emit_mov_at_rbx_rax();
+    }
+
+    fn emit_file_close(&mut self, args: &[Expr]) {
+        if args.len() != 1 {
+            panic!("codegen: close() takes 1 arg");
+        }
+        let file_name = match &args[0] {
+            Expr::Ident(n) => n.clone(),
+            _ => panic!("codegen: close() arg must be a file ident"),
+        };
+        let fd_off = self.file_fd_offset(&file_name);
+        self.emit_mov_imm64_reloc(RBX, fd_off);
+        self.emit_mov_rdi_from_rbx();
+        self.emit_mov_imm64(RAX, 3); // sys_close
+        self.emit_syscall();
+    }
+
+    fn emit_file_read(&mut self, args: &[Expr]) {
+        if args.len() != 2 {
+            panic!("codegen: read() takes 2 args");
+        }
+        let file_name = match &args[0] {
+            Expr::Ident(n) => n.clone(),
+            _ => panic!("codegen: read() first arg must be a file ident"),
+        };
+        let rec_name = match &args[1] {
+            Expr::Ident(n) => n.clone(),
+            _ => panic!("codegen: read() second arg must be a record ident"),
+        };
+        let fd_off = self.file_fd_offset(&file_name);
+        let eof_off = self.file_eof_offset(&file_name);
+        let rec_sym = self.lookup_symbol(&rec_name);
+        let rec_offset = rec_sym.offset_in_data;
+        let rec_size = self.record_size_of(&rec_name);
+
+        // syscall: read(fd, buf, count)
+        self.emit_mov_imm64_reloc(RBX, fd_off);
+        self.emit_mov_rdi_from_rbx();
+        self.emit_mov_imm64(RAX, 0); // sys_read
+        self.emit_mov_imm64_reloc(RSI, rec_offset);
+        self.emit_mov_imm64(RDX, rec_size);
+        self.emit_syscall();
+
+        // if rax == 0, set EOF flag
+        self.emit_test_rax_rax();
+        let skip_eof = self.emit_jne_placeholder();
+        self.emit_mov_imm64_reloc(RBX, eof_off);
+        self.emit_mov_imm64(RAX, 1);
+        self.emit_mov_at_rbx_rax();
+        let after = self.code.len();
+        self.patch_rel32(skip_eof, after);
+    }
+
+    fn emit_at_end(&mut self, args: &[Expr]) {
+        if args.len() != 1 {
+            panic!("codegen: at_end() takes 1 arg");
+        }
+        let file_name = match &args[0] {
+            Expr::Ident(n) => n.clone(),
+            _ => panic!("codegen: at_end() arg must be a file ident"),
+        };
+        let eof_off = self.file_eof_offset(&file_name);
+        self.emit_mov_imm64_reloc(RBX, eof_off);
+        self.emit_mov_rax_from_rbx();
+    }
+
     fn register_paragraphs(&mut self, program: &Program) {
         for stmt in &program.statements {
             if let Stmt::Par { name, .. } = stmt {
@@ -196,6 +335,9 @@ impl Codegen {
                         });
                         self.data.extend_from_slice(&vec![0u8; info.size as usize]);
                     }
+                    (TypeExpr::File, _) => {
+                        panic!("codegen: file type cannot appear in `let` declaration");
+                    }
                 }
                 self.symbols.push(Symbol {
                     name: name.clone(),
@@ -252,7 +394,10 @@ impl Codegen {
 
     fn emit_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Let { .. } | Stmt::Par { .. } | Stmt::TypeDef { .. } => {}
+            Stmt::Let { .. }
+            | Stmt::Par { .. }
+            | Stmt::TypeDef { .. }
+            | Stmt::FileDecl { .. } => {}
             Stmt::Assign { target, value } => self.emit_assign(target, value),
             Stmt::For {
                 var, start, end, body,
@@ -264,6 +409,12 @@ impl Codegen {
                         panic!("codegen: print() takes exactly one argument");
                     }
                     self.emit_print(&args[0]);
+                } else if name == "open" {
+                    self.emit_file_open(args);
+                } else if name == "close" {
+                    self.emit_file_close(args);
+                } else if name == "read" {
+                    self.emit_file_read(args);
                 } else if self.has_paragraph(name) {
                     if !args.is_empty() {
                         panic!("codegen: paragraph `{}` is param-less", name);
@@ -540,6 +691,13 @@ impl Codegen {
                 self.emit_setcc_dl_eq_zero();
                 self.emit_movzx_eax_dl();
             }
+            Expr::Call { name, args } => {
+                if name == "at_end" {
+                    self.emit_at_end(args);
+                } else {
+                    panic!("codegen: `{}` not callable in expression context", name);
+                }
+            }
             Expr::FieldAccess { base, field } => {
                 let base_name = match base.as_ref() {
                     Expr::Ident(name) => name,
@@ -626,6 +784,11 @@ impl Codegen {
     fn emit_mov_rax_from_rbx(&mut self) {
         // mov rax, [rbx]
         self.code.extend_from_slice(&[0x48, 0x8B, 0x03]);
+    }
+
+    fn emit_mov_rdi_from_rbx(&mut self) {
+        // mov rdi, [rbx]
+        self.code.extend_from_slice(&[0x48, 0x8B, 0x3B]);
     }
 
     fn emit_mov_at_rbx_rax(&mut self) {
@@ -864,6 +1027,7 @@ fn type_size(ty: &TypeExpr) -> u64 {
         TypeExpr::Str(n) => *n as u64,
         TypeExpr::UDec(_, _) | TypeExpr::IDec(_, _) => 8,
         TypeExpr::Record(_) => panic!("codegen: nested record fields not supported yet"),
+        TypeExpr::File => panic!("codegen: file type cannot be a field"),
     }
 }
 
@@ -913,7 +1077,8 @@ fn try_eval_const(expr: &Expr) -> Option<ConstValue> {
         | Expr::Ident(_)
         | Expr::Compare { .. }
         | Expr::Not { .. }
-        | Expr::FieldAccess { .. } => None,
+        | Expr::FieldAccess { .. }
+        | Expr::Call { .. } => None,
         Expr::BinaryOp { op, left, right } => {
             let l = match try_eval_const(left)? {
                 ConstValue::Int(n) => n,
