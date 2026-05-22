@@ -1,4 +1,4 @@
-use crate::ast::{Expr, Program, Stmt};
+use crate::ast::{BinOp, Expr, Program, Stmt};
 use crate::elf::ENTRY_VMA;
 
 // x86-64 register encodings used by the mov-imm64 opcode (0xB8 + reg).
@@ -15,9 +15,11 @@ const FD_STDOUT: u64 = 1;
 pub fn emit(program: &Program) -> Vec<u8> {
     let to_print: String = match program.statements.as_slice() {
         [Stmt::Call { name, args }] if name == "print" => match args.as_slice() {
-            [Expr::StringLit(s)] => s.clone(),
-            [Expr::IntLit(n)] => n.to_string(),
-            _ => panic!("codegen: print() expects one string or integer argument"),
+            [arg] => match eval_const(arg) {
+                ConstValue::Str(s) => s,
+                ConstValue::Int(n) => n.to_string(),
+            },
+            _ => panic!("codegen: print() expects exactly one argument"),
         },
         _ => panic!("codegen: only one `print(...)` statement supported"),
     };
@@ -61,4 +63,44 @@ fn emit_mov_imm64(out: &mut Vec<u8>, reg: u8, imm: u64) {
 fn emit_syscall(out: &mut Vec<u8>) {
     out.push(0x0F);
     out.push(0x05);
+}
+
+enum ConstValue {
+    Str(String),
+    Int(i64),
+}
+
+fn eval_const(expr: &Expr) -> ConstValue {
+    match expr {
+        Expr::StringLit(s) => ConstValue::Str(s.clone()),
+        Expr::IntLit(n) => ConstValue::Int(*n),
+        Expr::BinaryOp { op, left, right } => {
+            let l = match eval_const(left) {
+                ConstValue::Int(n) => n,
+                _ => panic!("codegen: arithmetic requires integer operands"),
+            };
+            let r = match eval_const(right) {
+                ConstValue::Int(n) => n,
+                _ => panic!("codegen: arithmetic requires integer operands"),
+            };
+            let v = match op {
+                BinOp::Add => l + r,
+                BinOp::Sub => l - r,
+                BinOp::Mul => l * r,
+                BinOp::Div => {
+                    if r == 0 {
+                        panic!("codegen: divide by zero");
+                    }
+                    l / r
+                }
+                BinOp::Mod => {
+                    if r == 0 {
+                        panic!("codegen: modulo by zero");
+                    }
+                    l % r
+                }
+            };
+            ConstValue::Int(v)
+        }
+    }
 }

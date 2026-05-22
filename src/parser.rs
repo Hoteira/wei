@@ -1,4 +1,4 @@
-use crate::ast::{Expr, Program, Stmt};
+use crate::ast::{BinOp, Expr, Program, Stmt};
 use crate::lexer::Token;
 
 pub fn parse(tokens: &[Token]) -> Program {
@@ -46,12 +46,62 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr(&mut self) -> Expr {
+        let mut left = self.parse_term();
+        while let Some(op) = self.peek_add_op() {
+            self.pos += 1;
+            let right = self.parse_term();
+            left = Expr::BinaryOp {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        left
+    }
+
+    fn parse_term(&mut self) -> Expr {
+        let mut left = self.parse_atom();
+        while let Some(op) = self.peek_mul_op() {
+            self.pos += 1;
+            let right = self.parse_atom();
+            left = Expr::BinaryOp {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        left
+    }
+
+    fn parse_atom(&mut self) -> Expr {
         let t = self.tokens[self.pos].clone();
         self.pos += 1;
         match t {
             Token::StringLit(s) => Expr::StringLit(s),
             Token::IntLit(n) => Expr::IntLit(n),
+            Token::LParen => {
+                let e = self.parse_expr();
+                self.expect_rparen();
+                e
+            }
             other => panic!("parse error: expected expression, got {:?}", other),
+        }
+    }
+
+    fn peek_add_op(&self) -> Option<BinOp> {
+        match self.peek() {
+            Token::Plus => Some(BinOp::Add),
+            Token::Minus => Some(BinOp::Sub),
+            _ => None,
+        }
+    }
+
+    fn peek_mul_op(&self) -> Option<BinOp> {
+        match self.peek() {
+            Token::Star => Some(BinOp::Mul),
+            Token::Slash => Some(BinOp::Div),
+            Token::Percent => Some(BinOp::Mod),
+            _ => None,
         }
     }
 

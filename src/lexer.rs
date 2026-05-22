@@ -5,6 +5,11 @@ pub enum Token {
     IntLit(i64),
     LParen,
     RParen,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
     Newline,
     Eof,
 }
@@ -36,6 +41,26 @@ pub fn lex(source: &str) -> Vec<Token> {
                 while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
                 }
+            }
+            b'+' => {
+                tokens.push(Token::Plus);
+                i += 1;
+            }
+            b'-' => {
+                tokens.push(Token::Minus);
+                i += 1;
+            }
+            b'*' => {
+                tokens.push(Token::Star);
+                i += 1;
+            }
+            b'/' => {
+                tokens.push(Token::Slash);
+                i += 1;
+            }
+            b'%' => {
+                tokens.push(Token::Percent);
+                i += 1;
             }
             b'"' => {
                 i += 1; // opening quote
