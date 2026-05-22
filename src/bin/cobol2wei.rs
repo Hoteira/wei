@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::process;
@@ -125,10 +126,31 @@ enum Literal {
 }
 
 #[derive(Debug)]
-struct WSItem {
+struct FileDecl {
+    name: String,
+    path: String,
+    org: String,
+}
+
+#[derive(Debug)]
+struct RecordType {
+    type_name: String,
+    var_name: String,
+    fields: Vec<(String, PicType)>,
+}
+
+#[derive(Debug)]
+struct WSScalar {
     name: String,
     ty: PicType,
     value: Option<Literal>,
+    eighty_eights: Vec<(String, Literal)>,
+}
+
+#[derive(Debug)]
+struct FdBinding {
+    file_name: String,
+    record_var: String,
 }
 
 #[derive(Debug)]
@@ -149,34 +171,22 @@ enum CmpOp {
 }
 
 #[derive(Debug)]
-struct Cond {
-    op: CmpOp,
-    left: Expr,
-    right: Expr,
+enum Cond {
+    Cmp { op: CmpOp, left: Expr, right: Expr },
+    Bare(String),
 }
 
 #[derive(Debug)]
 enum Stmt {
     Display(Expr),
-    Move {
-        value: Expr,
-        target: String,
-    },
-    Add {
-        value: Expr,
-        target: String,
-    },
-    Subtract {
-        value: Expr,
-        target: String,
-    },
-    Perform {
-        para: String,
-    },
-    PerformUntil {
-        cond: Cond,
-        body: Vec<Stmt>,
-    },
+    Move { value: Expr, target: String },
+    Add { value: Expr, target: String },
+    Subtract { value: Expr, target: String },
+    Perform { para: String },
+    PerformUntil { cond: Cond, body: Vec<Stmt> },
+    Open { mode: String, file: String },
+    Read { file: String, at_end_target: Option<String> },
+    Close { file: String },
     StopRun,
 }
 
@@ -186,16 +196,38 @@ struct Paragraph {
     body: Vec<Stmt>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Program {
-    ws_items: Vec<WSItem>,
+    files: Vec<FileDecl>,
+    records: Vec<RecordType>,
+    fds: Vec<FdBinding>,
+    ws_scalars: Vec<WSScalar>,
     main_code: Vec<Stmt>,
     paragraphs: Vec<Paragraph>,
 }
 
-// Convert COBOL ident (uppercase, hyphens) to wei ident (lowercase, underscores).
 fn to_wei_ident(s: &str) -> String {
     s.to_lowercase().replace('-', "_")
+}
+
+fn to_cobol_name(wei: &str) -> String {
+    wei.to_uppercase().replace('_', "-")
+}
+
+fn to_pascal_case(cobol: &str) -> String {
+    cobol
+        .split('-')
+        .map(|seg| {
+            let mut c = seg.chars();
+            match c.next() {
+                Some(first) => {
+                    first.to_ascii_uppercase().to_string()
+                        + &c.as_str().to_ascii_lowercase()
+                }
+                None => String::new(),
+            }
+        })
+        .collect()
 }
 
 struct Parser<'a> {
@@ -223,15 +255,16 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_program(&mut self) -> Program {
-        let mut program = Program {
-            ws_items: Vec::new(),
-            main_code: Vec::new(),
-            paragraphs: Vec::new(),
-        };
+        let mut program = Program::default();
 
-        // Walk through divisions
         while !self.at_eof() {
             match self.peek() {
+                Token::Word(w) if w == "ENVIRONMENT" => {
+                    self.advance();
+                    self.expect_word("DIVISION");
+                    self.expect_period();
+                    self.parse_environment_division(&mut program);
+                }
                 Token::Word(w) if w == "DATA" => {
                     self.advance();
                     self.expect_word("DIVISION");
@@ -246,7 +279,6 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 _ => {
-                    // Skip IDENTIFICATION / ENVIRONMENT preamble token by token
                     self.advance();
                 }
             }
@@ -255,21 +287,21 @@ impl<'a> Parser<'a> {
         program
     }
 
-    fn parse_data_division(&mut self, program: &mut Program) {
-        // Skip until WORKING-STORAGE SECTION
+    fn parse_environment_division(&mut self, program: &mut Program) {
         loop {
-            if self.at_eof() {
-                return;
-            }
             match self.peek() {
-                Token::Word(w) if w == "WORKING-STORAGE" => {
+                Token::Word(w) if w == "INPUT-OUTPUT" => {
                     self.advance();
                     self.expect_word("SECTION");
                     self.expect_period();
-                    self.parse_working_storage(program);
-                    return;
                 }
-                Token::Word(w) if w == "PROCEDURE" => return,
+                Token::Word(w) if w == "FILE-CONTROL" => {
+                    self.advance();
+                    self.expect_period();
+                    self.parse_file_control(program);
+                }
+                Token::Word(w) if w == "DATA" || w == "PROCEDURE" => return,
+                Token::Eof => return,
                 _ => {
                     self.advance();
                 }
@@ -277,12 +309,157 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_working_storage(&mut self, program: &mut Program) {
+    fn parse_file_control(&mut self, program: &mut Program) {
         loop {
             match self.peek() {
+                Token::Word(w) if w == "SELECT" => {
+                    self.advance();
+                    let fname = self.expect_word_any();
+                    self.expect_word("ASSIGN");
+                    self.expect_word("TO");
+                    let path = match self.advance() {
+                        Token::StringLit(s) => s,
+                        other => panic!(
+                            "cobol2wei: SELECT ASSIGN TO expected string literal, got {:?}",
+                            other
+                        ),
+                    };
+                    let mut org = "sequential".to_string();
+                    while !matches!(self.peek(), Token::Period) {
+                        match self.peek().clone() {
+                            Token::Word(w) if w == "ORGANIZATION" => {
+                                self.advance();
+                                if matches!(self.peek(), Token::Word(w) if w == "IS") {
+                                    self.advance();
+                                }
+                                let v = self.expect_word_any();
+                                org = v.to_lowercase();
+                            }
+                            Token::Eof => break,
+                            _ => {
+                                self.advance();
+                            }
+                        }
+                    }
+                    self.expect_period();
+                    program.files.push(FileDecl {
+                        name: to_wei_ident(&fname),
+                        path,
+                        org,
+                    });
+                }
+                Token::Word(w) if w == "DATA" || w == "PROCEDURE" => return,
+                Token::Eof => return,
+                _ => {
+                    self.advance();
+                }
+            }
+        }
+    }
+
+    fn parse_data_division(&mut self, program: &mut Program) {
+        loop {
+            if self.at_eof() {
+                return;
+            }
+            match self.peek().clone() {
+                Token::Word(ref w) if w == "FILE" && matches!(self.peek_n(1), Token::Word(s) if s == "SECTION") => {
+                    self.advance();
+                    self.advance();
+                    self.expect_period();
+                    self.parse_file_section(program);
+                }
+                Token::Word(ref w) if w == "WORKING-STORAGE" => {
+                    self.advance();
+                    self.expect_word("SECTION");
+                    self.expect_period();
+                    self.parse_working_storage(program);
+                }
+                Token::Word(ref w) if w == "PROCEDURE" => return,
+                _ => {
+                    self.advance();
+                }
+            }
+        }
+    }
+
+    fn parse_file_section(&mut self, program: &mut Program) {
+        loop {
+            match self.peek().clone() {
+                Token::Word(ref w) if w == "FD" => {
+                    self.advance();
+                    let file_cobol = self.expect_word_any();
+                    self.expect_period();
+                    let level = self.expect_intlit();
+                    if level != 1 {
+                        panic!("cobol2wei: expected 01-level after FD, got {}", level);
+                    }
+                    let rec_cobol = self.expect_word_any();
+                    self.expect_period();
+                    let record_var = to_wei_ident(&rec_cobol);
+                    let type_name = to_pascal_case(&rec_cobol);
+                    let mut fields = Vec::new();
+                    while let Token::IntLit(n) = self.peek().clone() {
+                        if n == 1 || n == 88 {
+                            break;
+                        }
+                        if !(2..=49).contains(&n) {
+                            break;
+                        }
+                        self.advance();
+                        let fname = self.expect_word_any();
+                        self.expect_word("PIC");
+                        let ty = self.parse_pic();
+                        self.expect_period();
+                        fields.push((to_wei_ident(&fname), ty));
+                    }
+                    program.records.push(RecordType {
+                        type_name,
+                        var_name: record_var.clone(),
+                        fields,
+                    });
+                    program.fds.push(FdBinding {
+                        file_name: to_wei_ident(&file_cobol),
+                        record_var,
+                    });
+                }
+                Token::Word(ref w) if w == "WORKING-STORAGE" || w == "PROCEDURE" => return,
+                Token::Eof => return,
+                other => panic!("cobol2wei: unexpected token in FILE SECTION: {:?}", other),
+            }
+        }
+    }
+
+    fn parse_working_storage(&mut self, program: &mut Program) {
+        loop {
+            match self.peek().clone() {
                 Token::IntLit(1) => {
                     self.advance();
                     let name = self.expect_word_any();
+                    if matches!(self.peek(), Token::Period) {
+                        self.advance();
+                        let mut fields = Vec::new();
+                        while let Token::IntLit(n) = self.peek().clone() {
+                            if n == 1 || n == 88 {
+                                break;
+                            }
+                            if !(2..=49).contains(&n) {
+                                break;
+                            }
+                            self.advance();
+                            let fname = self.expect_word_any();
+                            self.expect_word("PIC");
+                            let ty = self.parse_pic();
+                            self.expect_period();
+                            fields.push((to_wei_ident(&fname), ty));
+                        }
+                        program.records.push(RecordType {
+                            type_name: to_pascal_case(&name),
+                            var_name: to_wei_ident(&name),
+                            fields,
+                        });
+                        continue;
+                    }
                     self.expect_word("PIC");
                     let ty = self.parse_pic();
                     let value = if matches!(self.peek(), Token::Word(w) if w == "VALUE") {
@@ -292,13 +469,23 @@ impl<'a> Parser<'a> {
                         None
                     };
                     self.expect_period();
-                    program.ws_items.push(WSItem {
+                    let mut scalar = WSScalar {
                         name: to_wei_ident(&name),
                         ty,
                         value,
-                    });
+                        eighty_eights: Vec::new(),
+                    };
+                    while matches!(self.peek(), Token::IntLit(88)) {
+                        self.advance();
+                        let cname = self.expect_word_any();
+                        self.expect_word("VALUE");
+                        let v = self.parse_literal();
+                        self.expect_period();
+                        scalar.eighty_eights.push((to_wei_ident(&cname), v));
+                    }
+                    program.ws_scalars.push(scalar);
                 }
-                Token::Word(w) if w == "PROCEDURE" => return,
+                Token::Word(ref w) if w == "PROCEDURE" => return,
                 Token::Eof => return,
                 other => panic!(
                     "cobol2wei: unexpected token in WORKING-STORAGE: {:?}",
@@ -309,7 +496,6 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_pic(&mut self) -> PicType {
-        // PIC X, PIC X(N), PIC 9, PIC 9(N), PIC 9(N)V99
         match self.peek().clone() {
             Token::Word(ref w) if w == "X" => {
                 self.advance();
@@ -324,7 +510,7 @@ impl<'a> Parser<'a> {
                 PicType::Str(n)
             }
             Token::IntLit(_) => {
-                self.advance(); // consume the leading 9-pattern digit literal
+                self.advance();
                 let n = if matches!(self.peek(), Token::LParen) {
                     self.advance();
                     let n = self.expect_intlit() as u32;
@@ -333,7 +519,6 @@ impl<'a> Parser<'a> {
                 } else {
                     1
                 };
-                // Optional V99 fractional part
                 if let Token::Word(w) = self.peek() {
                     if w.starts_with('V') && w.len() > 1 {
                         let frac_digits = w[1..].chars().filter(|c| c.is_ascii_digit()).count();
@@ -387,7 +572,7 @@ impl<'a> Parser<'a> {
                     continue;
                 }
             }
-            let s = self.parse_statement();
+            let s = self.parse_statement(false);
             current_body.push(s);
         }
 
@@ -401,50 +586,49 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_statement(&mut self) -> Stmt {
+    fn parse_statement(&mut self, in_block: bool) -> Stmt {
         match self.peek().clone() {
-            Token::Word(w) if w == "DISPLAY" => {
+            Token::Word(ref w) if w == "DISPLAY" => {
                 self.advance();
                 let e = self.parse_expr();
-                self.expect_period();
+                self.end_stmt(in_block);
                 Stmt::Display(e)
             }
-            Token::Word(w) if w == "MOVE" => {
+            Token::Word(ref w) if w == "MOVE" => {
                 self.advance();
                 let value = self.parse_expr();
                 self.expect_word("TO");
                 let target = self.expect_word_any();
-                self.expect_period();
+                self.end_stmt(in_block);
                 Stmt::Move {
                     value,
                     target: to_wei_ident(&target),
                 }
             }
-            Token::Word(w) if w == "ADD" => {
+            Token::Word(ref w) if w == "ADD" => {
                 self.advance();
                 let value = self.parse_expr();
                 self.expect_word("TO");
                 let target = self.expect_word_any();
-                self.expect_period();
+                self.end_stmt(in_block);
                 Stmt::Add {
                     value,
                     target: to_wei_ident(&target),
                 }
             }
-            Token::Word(w) if w == "SUBTRACT" => {
+            Token::Word(ref w) if w == "SUBTRACT" => {
                 self.advance();
                 let value = self.parse_expr();
                 self.expect_word("FROM");
                 let target = self.expect_word_any();
-                self.expect_period();
+                self.end_stmt(in_block);
                 Stmt::Subtract {
                     value,
                     target: to_wei_ident(&target),
                 }
             }
-            Token::Word(w) if w == "PERFORM" => {
+            Token::Word(ref w) if w == "PERFORM" => {
                 self.advance();
-                // PERFORM UNTIL cond ... END-PERFORM, or PERFORM paragraph-name.
                 if matches!(self.peek(), Token::Word(w) if w == "UNTIL") {
                     self.advance();
                     let cond = self.parse_condition();
@@ -453,138 +637,124 @@ impl<'a> Parser<'a> {
                         if self.at_eof() {
                             panic!("cobol2wei: unterminated PERFORM UNTIL (missing END-PERFORM)");
                         }
-                        body.push(self.parse_statement_no_period());
+                        body.push(self.parse_statement(true));
                     }
                     self.expect_word("END-PERFORM");
-                    self.expect_period();
+                    self.end_stmt(in_block);
                     Stmt::PerformUntil { cond, body }
                 } else {
                     let para = self.expect_word_any();
-                    self.expect_period();
+                    self.end_stmt(in_block);
                     Stmt::Perform {
                         para: to_wei_ident(&para),
                     }
                 }
             }
-            Token::Word(w) if w == "STOP" => {
+            Token::Word(ref w) if w == "OPEN" => {
+                self.advance();
+                let mode_raw = self.expect_word_any();
+                let mode = match mode_raw.as_str() {
+                    "INPUT" => "input",
+                    "OUTPUT" => "output",
+                    "I-O" => "i_o",
+                    "EXTEND" => "extend",
+                    other => panic!("cobol2wei: unknown OPEN mode {}", other),
+                }
+                .to_string();
+                let file = self.expect_word_any();
+                self.end_stmt(in_block);
+                Stmt::Open {
+                    mode,
+                    file: to_wei_ident(&file),
+                }
+            }
+            Token::Word(ref w) if w == "CLOSE" => {
+                self.advance();
+                let file = self.expect_word_any();
+                self.end_stmt(in_block);
+                Stmt::Close {
+                    file: to_wei_ident(&file),
+                }
+            }
+            Token::Word(ref w) if w == "READ" => {
+                self.advance();
+                let file = self.expect_word_any();
+                let at_end_target = self.parse_at_end_clause();
+                self.end_stmt(in_block);
+                Stmt::Read {
+                    file: to_wei_ident(&file),
+                    at_end_target,
+                }
+            }
+            Token::Word(ref w) if w == "STOP" => {
                 self.advance();
                 self.expect_word("RUN");
-                self.expect_period();
+                self.end_stmt(in_block);
                 Stmt::StopRun
             }
             other => panic!("cobol2wei: unsupported statement starting with {:?}", other),
         }
     }
 
-    // Inside PERFORM UNTIL ... END-PERFORM, the inner statements don't need their own
-    // periods (COBOL convention — periods only outside the block). We accept either form.
-    fn parse_statement_no_period(&mut self) -> Stmt {
-        // Backup approach: just call parse_statement. The trailing period is optional
-        // for inline statements. For simplicity, require it for now.
-        // COBOL allows the inner statements without periods inside PERFORM ... END-PERFORM.
-        match self.peek().clone() {
-            Token::Word(w) if w == "ADD" => {
-                self.advance();
-                let value = self.parse_expr();
-                self.expect_word("TO");
-                let target = self.expect_word_any();
-                self.consume_period();
-                Stmt::Add {
-                    value,
-                    target: to_wei_ident(&target),
-                }
-            }
-            Token::Word(w) if w == "SUBTRACT" => {
-                self.advance();
-                let value = self.parse_expr();
-                self.expect_word("FROM");
-                let target = self.expect_word_any();
-                self.consume_period();
-                Stmt::Subtract {
-                    value,
-                    target: to_wei_ident(&target),
-                }
-            }
-            Token::Word(w) if w == "MOVE" => {
-                self.advance();
-                let value = self.parse_expr();
-                self.expect_word("TO");
-                let target = self.expect_word_any();
-                self.consume_period();
-                Stmt::Move {
-                    value,
-                    target: to_wei_ident(&target),
-                }
-            }
-            Token::Word(w) if w == "DISPLAY" => {
-                self.advance();
-                let e = self.parse_expr();
-                self.consume_period();
-                Stmt::Display(e)
-            }
-            Token::Word(w) if w == "PERFORM" => {
-                self.advance();
-                if matches!(self.peek(), Token::Word(w) if w == "UNTIL") {
-                    self.advance();
-                    let cond = self.parse_condition();
-                    let mut body = Vec::new();
-                    while !matches!(self.peek(), Token::Word(w) if w == "END-PERFORM") {
-                        if self.at_eof() {
-                            panic!("cobol2wei: unterminated nested PERFORM UNTIL");
-                        }
-                        body.push(self.parse_statement_no_period());
-                    }
-                    self.expect_word("END-PERFORM");
-                    self.consume_period();
-                    Stmt::PerformUntil { cond, body }
-                } else {
-                    let para = self.expect_word_any();
-                    self.consume_period();
-                    Stmt::Perform {
-                        para: to_wei_ident(&para),
-                    }
-                }
-            }
-            other => panic!(
-                "cobol2wei: unsupported statement inside block: {:?}",
-                other
-            ),
+    fn parse_at_end_clause(&mut self) -> Option<String> {
+        if !matches!(self.peek(), Token::Word(w) if w == "AT") {
+            return None;
         }
+        self.advance();
+        self.expect_word("END");
+        self.expect_word("MOVE");
+        let _val = self.parse_literal();
+        self.expect_word("TO");
+        let target = self.expect_word_any();
+        self.expect_word("END-READ");
+        Some(to_wei_ident(&target))
     }
 
     fn parse_condition(&mut self) -> Cond {
         let left = self.parse_expr();
-        // Check for NOT prefix on operator
         let mut negated = false;
         if matches!(self.peek(), Token::Word(w) if w == "NOT") {
             self.advance();
             negated = true;
         }
-        let op = match self.advance() {
-            Token::Eq => CmpOp::Eq,
-            Token::Lt => CmpOp::Lt,
-            Token::Gt => CmpOp::Gt,
-            Token::LtEq => CmpOp::Le,
-            Token::GtEq => CmpOp::Ge,
-            other => panic!("cobol2wei: expected comparison operator, got {:?}", other),
+        let op = match self.peek() {
+            Token::Eq => Some(CmpOp::Eq),
+            Token::Lt => Some(CmpOp::Lt),
+            Token::Gt => Some(CmpOp::Gt),
+            Token::LtEq => Some(CmpOp::Le),
+            Token::GtEq => Some(CmpOp::Ge),
+            _ => None,
         };
-        let right = self.parse_expr();
-        let final_op = if negated {
-            match op {
-                CmpOp::Eq => CmpOp::Ne,
-                CmpOp::Ne => CmpOp::Eq,
-                CmpOp::Lt => CmpOp::Ge,
-                CmpOp::Le => CmpOp::Gt,
-                CmpOp::Gt => CmpOp::Le,
-                CmpOp::Ge => CmpOp::Lt,
-            }
-        } else {
-            op
-        };
-        Cond {
-            op: final_op,
-            left,
-            right,
+        if let Some(op) = op {
+            self.advance();
+            let right = self.parse_expr();
+            let final_op = if negated {
+                match op {
+                    CmpOp::Eq => CmpOp::Ne,
+                    CmpOp::Ne => CmpOp::Eq,
+                    CmpOp::Lt => CmpOp::Ge,
+                    CmpOp::Le => CmpOp::Gt,
+                    CmpOp::Gt => CmpOp::Le,
+                    CmpOp::Ge => CmpOp::Lt,
+                }
+            } else {
+                op
+            };
+            return Cond::Cmp {
+                op: final_op,
+                left,
+                right,
+            };
+        }
+        if negated {
+            panic!("cobol2wei: NOT without comparison operator");
+        }
+        match left {
+            Expr::Ident(n) => Cond::Bare(n),
+            other => panic!(
+                "cobol2wei: expected comparison or 88-level name, got {:?}",
+                other
+            ),
         }
     }
 
@@ -594,6 +764,16 @@ impl<'a> Parser<'a> {
             Token::StringLit(s) => Expr::Str(s),
             Token::Word(w) => Expr::Ident(to_wei_ident(&w)),
             other => panic!("cobol2wei: expected expression, got {:?}", other),
+        }
+    }
+
+    fn end_stmt(&mut self, in_block: bool) {
+        if in_block {
+            if matches!(self.peek(), Token::Period) {
+                self.advance();
+            }
+        } else {
+            self.expect_period();
         }
     }
 
@@ -631,12 +811,6 @@ impl<'a> Parser<'a> {
             other => panic!("cobol2wei: expected `)`, got {:?}", other),
         }
     }
-
-    fn consume_period(&mut self) {
-        if matches!(self.peek(), Token::Period) {
-            self.advance();
-        }
-    }
 }
 
 fn is_verb(w: &str) -> bool {
@@ -661,147 +835,92 @@ fn is_verb(w: &str) -> bool {
     )
 }
 
-fn emit(program: &Program) -> String {
-    let mut out = String::new();
+#[derive(Default)]
+struct Resolved {
+    field_owner: HashMap<String, String>,
+    fd_record: HashMap<String, String>,
+    eof_flag_for_file: HashMap<String, String>,
+    eighty_eight_parent: HashMap<String, String>,
+    file_for_eighty_eight: HashMap<String, String>,
+    suppressed_flags: HashSet<String>,
+}
 
-    // WORKING-STORAGE → top-level lets
-    for item in &program.ws_items {
-        let ty_str = match &item.ty {
-            PicType::Str(n) => format!("str({})", n),
-            PicType::UInt(n) => format!("uint({})", n),
-            PicType::UDec(n, m) => format!("udec({},{})", n, m),
-        };
-        out.push_str(&format!("// COBOL: 01 {} PIC ...\n", item.name.to_uppercase()));
-        match &item.value {
-            Some(Literal::Int(v)) => {
-                out.push_str(&format!("let {} {} = {}\n", item.name, ty_str, v));
-            }
-            Some(Literal::Str(s)) => {
-                out.push_str(&format!("let {} {} = \"{}\"\n", item.name, ty_str, s));
-            }
-            None => {
-                out.push_str(&format!("let {} {}\n", item.name, ty_str));
-            }
+fn resolve(program: &Program) -> Resolved {
+    let mut r = Resolved::default();
+    for fd in &program.fds {
+        r.fd_record.insert(fd.file_name.clone(), fd.record_var.clone());
+    }
+    for rec in &program.records {
+        for (fname, _) in &rec.fields {
+            r.field_owner.insert(fname.clone(), rec.var_name.clone());
         }
     }
-    out.push('\n');
-
-    // Paragraphs
+    for s in &program.ws_scalars {
+        for (cn, _) in &s.eighty_eights {
+            r.eighty_eight_parent.insert(cn.clone(), s.name.clone());
+        }
+    }
+    walk(&program.main_code, &mut r);
     for p in &program.paragraphs {
-        out.push_str(&format!("// COBOL: {}.\n", p.name.to_uppercase().replace('_', "-")));
-        out.push_str(&format!("par {}:\n", p.name));
-        for s in &p.body {
-            emit_stmt(&mut out, s, 1);
-        }
-        out.push('\n');
+        walk(&p.body, &mut r);
     }
-
-    // Main code (either top-level statements, or call to the first paragraph)
-    if !program.main_code.is_empty() {
-        out.push_str("// COBOL: (procedure body / main)\n");
-        for s in &program.main_code {
-            emit_stmt(&mut out, s, 0);
-        }
-    } else if !program.paragraphs.is_empty() {
-        // No anonymous main, call first paragraph as the implicit entry
-        let first = &program.paragraphs[0];
-        out.push_str(&format!("{}()\n", first.name));
+    let mut flag_to_file: HashMap<String, String> = HashMap::new();
+    for (file, flag) in &r.eof_flag_for_file {
+        flag_to_file.insert(flag.clone(), file.clone());
     }
-
-    out
+    for (eight, parent) in &r.eighty_eight_parent {
+        if let Some(file) = flag_to_file.get(parent) {
+            r.file_for_eighty_eight.insert(eight.clone(), file.clone());
+            r.suppressed_flags.insert(parent.clone());
+        }
+    }
+    r
 }
 
-fn emit_stmt(out: &mut String, s: &Stmt, indent: usize) {
-    let pad = "    ".repeat(indent);
-    match s {
-        Stmt::Display(e) => {
-            out.push_str(&format!("{}// COBOL: DISPLAY {}.\n", pad, expr_cobol_text(e)));
-            out.push_str(&format!("{}print({})\n", pad, expr_wei_text(e)));
-        }
-        Stmt::Move { value, target } => {
-            out.push_str(&format!(
-                "{}// COBOL: MOVE {} TO {}.\n",
-                pad,
-                expr_cobol_text(value),
-                target.to_uppercase().replace('_', "-")
-            ));
-            out.push_str(&format!(
-                "{}{} = {}\n",
-                pad,
-                target,
-                expr_wei_text(value)
-            ));
-        }
-        Stmt::Add { value, target } => {
-            out.push_str(&format!(
-                "{}// COBOL: ADD {} TO {}.\n",
-                pad,
-                expr_cobol_text(value),
-                target.to_uppercase().replace('_', "-")
-            ));
-            out.push_str(&format!(
-                "{}{} = {} + {}\n",
-                pad,
-                target,
-                target,
-                expr_wei_text(value)
-            ));
-        }
-        Stmt::Subtract { value, target } => {
-            out.push_str(&format!(
-                "{}// COBOL: SUBTRACT {} FROM {}.\n",
-                pad,
-                expr_cobol_text(value),
-                target.to_uppercase().replace('_', "-")
-            ));
-            out.push_str(&format!(
-                "{}{} = {} - {}\n",
-                pad,
-                target,
-                target,
-                expr_wei_text(value)
-            ));
-        }
-        Stmt::Perform { para } => {
-            out.push_str(&format!(
-                "{}// COBOL: PERFORM {}.\n",
-                pad,
-                para.to_uppercase().replace('_', "-")
-            ));
-            out.push_str(&format!("{}{}()\n", pad, para));
-        }
-        Stmt::PerformUntil { cond, body } => {
-            out.push_str(&format!(
-                "{}// COBOL: PERFORM UNTIL {} ...\n",
-                pad,
-                cond_cobol_text(cond)
-            ));
-            out.push_str(&format!(
-                "{}while !({}):\n",
-                pad,
-                cond_wei_text(cond)
-            ));
-            for s in body {
-                emit_stmt(out, s, indent + 1);
+fn walk(stmts: &[Stmt], r: &mut Resolved) {
+    for s in stmts {
+        match s {
+            Stmt::Read {
+                file,
+                at_end_target: Some(t),
+            } => {
+                r.eof_flag_for_file
+                    .entry(file.clone())
+                    .or_insert_with(|| t.clone());
             }
-        }
-        Stmt::StopRun => {
-            out.push_str(&format!("{}// COBOL: STOP RUN.\n", pad));
+            Stmt::PerformUntil { body, .. } => walk(body, r),
+            _ => {}
         }
     }
 }
 
-fn expr_wei_text(e: &Expr) -> String {
+fn pic_to_str(ty: &PicType) -> String {
+    match ty {
+        PicType::Str(n) => format!("str({})", n),
+        PicType::UInt(n) => format!("uint({})", n),
+        PicType::UDec(n, m) => format!("udec({},{})", n, m),
+    }
+}
+
+fn qualified(name: &str, r: &Resolved) -> String {
+    if let Some(rec) = r.field_owner.get(name) {
+        format!("{}.{}", rec, name)
+    } else {
+        name.to_string()
+    }
+}
+
+fn expr_wei(e: &Expr, r: &Resolved) -> String {
     match e {
-        Expr::Ident(n) => n.clone(),
+        Expr::Ident(n) => qualified(n, r),
         Expr::Int(v) => v.to_string(),
         Expr::Str(s) => format!("\"{}\"", s),
     }
 }
 
-fn expr_cobol_text(e: &Expr) -> String {
+fn expr_cobol(e: &Expr) -> String {
     match e {
-        Expr::Ident(n) => n.to_uppercase().replace('_', "-"),
+        Expr::Ident(n) => to_cobol_name(n),
         Expr::Int(v) => v.to_string(),
         Expr::Str(s) => format!("\"{}\"", s),
     }
@@ -829,22 +948,226 @@ fn cmp_cobol(op: CmpOp) -> &'static str {
     }
 }
 
-fn cond_wei_text(c: &Cond) -> String {
-    format!(
-        "{} {} {}",
-        expr_wei_text(&c.left),
-        cmp_wei(c.op),
-        expr_wei_text(&c.right)
-    )
+fn cond_wei(c: &Cond, r: &Resolved) -> String {
+    match c {
+        Cond::Cmp { op, left, right } => format!(
+            "{} {} {}",
+            expr_wei(left, r),
+            cmp_wei(*op),
+            expr_wei(right, r)
+        ),
+        Cond::Bare(n) => {
+            if let Some(file) = r.file_for_eighty_eight.get(n) {
+                format!("at_end({})", file)
+            } else {
+                panic!(
+                    "cobol2wei: unsupported: bare condition `{}` (only 88-level EOF pattern supported)",
+                    to_cobol_name(n)
+                );
+            }
+        }
+    }
 }
 
-fn cond_cobol_text(c: &Cond) -> String {
-    format!(
-        "{} {} {}",
-        expr_cobol_text(&c.left),
-        cmp_cobol(c.op),
-        expr_cobol_text(&c.right)
-    )
+fn cond_cobol(c: &Cond) -> String {
+    match c {
+        Cond::Cmp { op, left, right } => format!(
+            "{} {} {}",
+            expr_cobol(left),
+            cmp_cobol(*op),
+            expr_cobol(right)
+        ),
+        Cond::Bare(n) => to_cobol_name(n),
+    }
+}
+
+fn emit(program: &Program) -> String {
+    let r = resolve(program);
+    let mut out = String::new();
+
+    for rec in &program.records {
+        out.push_str(&format!(
+            "// COBOL: 01 {}.\n",
+            to_cobol_name(&rec.var_name)
+        ));
+        out.push_str(&format!("type {}:\n", rec.type_name));
+        for (fname, ty) in &rec.fields {
+            out.push_str(&format!("    {} {}\n", fname, pic_to_str(ty)));
+        }
+        out.push('\n');
+    }
+
+    for f in &program.files {
+        out.push_str(&format!(
+            "// COBOL: SELECT {} ASSIGN TO \"{}\" ORGANIZATION IS {}.\n",
+            to_cobol_name(&f.name),
+            f.path,
+            f.org.to_uppercase()
+        ));
+        out.push_str(&format!("file {} = \"{}\" {}\n", f.name, f.path, f.org));
+    }
+    if !program.files.is_empty() {
+        out.push('\n');
+    }
+
+    for rec in &program.records {
+        out.push_str(&format!("let {} {}\n", rec.var_name, rec.type_name));
+    }
+
+    for s in &program.ws_scalars {
+        if r.suppressed_flags.contains(&s.name) {
+            continue;
+        }
+        let ty_str = pic_to_str(&s.ty);
+        out.push_str(&format!("// COBOL: 01 {} PIC ...\n", to_cobol_name(&s.name)));
+        match &s.value {
+            Some(Literal::Int(v)) => {
+                out.push_str(&format!("let {} {} = {}\n", s.name, ty_str, v));
+            }
+            Some(Literal::Str(sv)) => {
+                out.push_str(&format!("let {} {} = \"{}\"\n", s.name, ty_str, sv));
+            }
+            None => {
+                out.push_str(&format!("let {} {}\n", s.name, ty_str));
+            }
+        }
+    }
+    if !program.ws_scalars.iter().all(|s| r.suppressed_flags.contains(&s.name))
+        || !program.records.is_empty()
+    {
+        out.push('\n');
+    }
+
+    for p in &program.paragraphs {
+        out.push_str(&format!("// COBOL: {}.\n", to_cobol_name(&p.name)));
+        out.push_str(&format!("par {}:\n", p.name));
+        for s in &p.body {
+            emit_stmt(&mut out, s, 1, &r);
+        }
+        out.push('\n');
+    }
+
+    if !program.main_code.is_empty() {
+        out.push_str("// COBOL: (procedure body / main)\n");
+        for s in &program.main_code {
+            emit_stmt(&mut out, s, 0, &r);
+        }
+    } else if !program.paragraphs.is_empty() {
+        let first = &program.paragraphs[0];
+        out.push_str(&format!("{}()\n", first.name));
+    }
+
+    out
+}
+
+fn emit_stmt(out: &mut String, s: &Stmt, indent: usize, r: &Resolved) {
+    let pad = "    ".repeat(indent);
+    match s {
+        Stmt::Display(e) => {
+            out.push_str(&format!("{}// COBOL: DISPLAY {}.\n", pad, expr_cobol(e)));
+            out.push_str(&format!("{}print({})\n", pad, expr_wei(e, r)));
+        }
+        Stmt::Move { value, target } => {
+            out.push_str(&format!(
+                "{}// COBOL: MOVE {} TO {}.\n",
+                pad,
+                expr_cobol(value),
+                to_cobol_name(target)
+            ));
+            out.push_str(&format!(
+                "{}{} = {}\n",
+                pad,
+                qualified(target, r),
+                expr_wei(value, r)
+            ));
+        }
+        Stmt::Add { value, target } => {
+            out.push_str(&format!(
+                "{}// COBOL: ADD {} TO {}.\n",
+                pad,
+                expr_cobol(value),
+                to_cobol_name(target)
+            ));
+            let tgt = qualified(target, r);
+            out.push_str(&format!(
+                "{}{} = {} + {}\n",
+                pad,
+                tgt,
+                tgt,
+                expr_wei(value, r)
+            ));
+        }
+        Stmt::Subtract { value, target } => {
+            out.push_str(&format!(
+                "{}// COBOL: SUBTRACT {} FROM {}.\n",
+                pad,
+                expr_cobol(value),
+                to_cobol_name(target)
+            ));
+            let tgt = qualified(target, r);
+            out.push_str(&format!(
+                "{}{} = {} - {}\n",
+                pad,
+                tgt,
+                tgt,
+                expr_wei(value, r)
+            ));
+        }
+        Stmt::Perform { para } => {
+            out.push_str(&format!(
+                "{}// COBOL: PERFORM {}.\n",
+                pad,
+                to_cobol_name(para)
+            ));
+            out.push_str(&format!("{}{}()\n", pad, para));
+        }
+        Stmt::PerformUntil { cond, body } => {
+            out.push_str(&format!(
+                "{}// COBOL: PERFORM UNTIL {} ...\n",
+                pad,
+                cond_cobol(cond)
+            ));
+            out.push_str(&format!("{}while !({}):\n", pad, cond_wei(cond, r)));
+            for s in body {
+                emit_stmt(out, s, indent + 1, r);
+            }
+        }
+        Stmt::Open { mode, file } => {
+            out.push_str(&format!(
+                "{}// COBOL: OPEN {} {}.\n",
+                pad,
+                mode.to_uppercase().replace('_', "-"),
+                to_cobol_name(file)
+            ));
+            out.push_str(&format!("{}open({}, {})\n", pad, file, mode));
+        }
+        Stmt::Close { file } => {
+            out.push_str(&format!("{}// COBOL: CLOSE {}.\n", pad, to_cobol_name(file)));
+            out.push_str(&format!("{}close({})\n", pad, file));
+        }
+        Stmt::Read {
+            file,
+            at_end_target,
+        } => {
+            let suffix = at_end_target
+                .as_ref()
+                .map(|t| format!(" AT END MOVE ... TO {} END-READ", to_cobol_name(t)))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "{}// COBOL: READ {}{}.\n",
+                pad,
+                to_cobol_name(file),
+                suffix
+            ));
+            let rec = r.fd_record.get(file).unwrap_or_else(|| {
+                panic!("cobol2wei: READ {} has no FD record binding", file)
+            });
+            out.push_str(&format!("{}read({}, {})\n", pad, file, rec));
+        }
+        Stmt::StopRun => {
+            out.push_str(&format!("{}// COBOL: STOP RUN.\n", pad));
+        }
+    }
 }
 
 fn main() {
