@@ -201,7 +201,7 @@ impl Checker {
     }
 
     fn check_decimal_init(&mut self, init: &Expr, big_n: u32, m: u32, var_name: &str) {
-        let max_scaled = 10i64.checked_pow(big_n).map(|x| x - 1).unwrap_or(i64::MAX);
+        let max_scaled = 10i64.checked_pow(big_n + m).map(|x| x - 1).unwrap_or(i64::MAX);
         match init {
             Expr::IntLit(v) => {
                 let scale_factor = 10i64.checked_pow(m).unwrap_or(i64::MAX);
