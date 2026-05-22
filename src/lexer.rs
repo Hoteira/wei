@@ -10,6 +10,7 @@ pub enum Token {
     Star,
     Slash,
     Percent,
+    Eq,
     Newline,
     Eof,
 }
@@ -60,6 +61,10 @@ pub fn lex(source: &str) -> Vec<Token> {
             }
             b'%' => {
                 tokens.push(Token::Percent);
+                i += 1;
+            }
+            b'=' => {
+                tokens.push(Token::Eq);
                 i += 1;
             }
             b'"' => {

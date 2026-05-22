@@ -1,4 +1,4 @@
-use crate::ast::{BinOp, Expr, Program, Stmt};
+use crate::ast::{BinOp, Expr, Program, Stmt, TypeExpr};
 use crate::lexer::Token;
 
 pub fn parse(tokens: &[Token]) -> Program {
@@ -35,6 +35,41 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_statement(&mut self) -> Stmt {
+        if let Token::Ident(name) = self.peek() {
+            if name == "let" {
+                return self.parse_let();
+            }
+        }
+        self.parse_call()
+    }
+
+    fn parse_let(&mut self) -> Stmt {
+        self.pos += 1; // consume "let"
+        let name = self.expect_ident();
+        let ty = self.parse_type();
+        self.expect_eq();
+        let init = self.parse_expr();
+        Stmt::Let { name, ty, init }
+    }
+
+    fn parse_type(&mut self) -> TypeExpr {
+        let name = self.expect_ident();
+        self.expect_lparen();
+        let n = match self.tokens[self.pos].clone() {
+            Token::IntLit(n) => {
+                self.pos += 1;
+                n
+            }
+            other => panic!("parse error: expected integer in type, got {:?}", other),
+        };
+        self.expect_rparen();
+        match name.as_str() {
+            "uint" => TypeExpr::UInt(n as u32),
+            other => panic!("parse error: unknown type `{}`", other),
+        }
+    }
+
+    fn parse_call(&mut self) -> Stmt {
         let name = self.expect_ident();
         self.expect_lparen();
         let arg = self.parse_expr();
@@ -79,6 +114,7 @@ impl<'a> Parser<'a> {
         match t {
             Token::StringLit(s) => Expr::StringLit(s),
             Token::IntLit(n) => Expr::IntLit(n),
+            Token::Ident(n) => Expr::Ident(n),
             Token::LParen => {
                 let e = self.parse_expr();
                 self.expect_rparen();
@@ -127,6 +163,14 @@ impl<'a> Parser<'a> {
         self.pos += 1;
         if !matches!(t, Token::RParen) {
             panic!("parse error: expected ')', got {:?}", t);
+        }
+    }
+
+    fn expect_eq(&mut self) {
+        let t = self.tokens[self.pos].clone();
+        self.pos += 1;
+        if !matches!(t, Token::Eq) {
+            panic!("parse error: expected '=', got {:?}", t);
         }
     }
 }

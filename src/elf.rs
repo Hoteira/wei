@@ -40,7 +40,7 @@ pub fn write_elf(path: &str, segment: &[u8]) -> io::Result<()> {
 
     // header
     buf.extend_from_slice(&1u32.to_le_bytes()); // p_type   = PT_LOAD
-    buf.extend_from_slice(&5u32.to_le_bytes()); // p_flags  = PF_R | PF_X (read + execute)
+    buf.extend_from_slice(&7u32.to_le_bytes()); // p_flags  = PF_R | PF_W | PF_X
     buf.extend_from_slice(&0u64.to_le_bytes()); // p_offset (load from start of file)
     buf.extend_from_slice(&LOAD_ADDR.to_le_bytes()); // p_vaddr
     buf.extend_from_slice(&LOAD_ADDR.to_le_bytes()); // p_paddr  (irrelevant on Linux but conventionally same)

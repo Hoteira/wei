@@ -5,7 +5,20 @@ pub struct Program {
 
 #[derive(Debug)]
 pub enum Stmt {
-    Call { name: String, args: Vec<Expr> },
+    Let {
+        name: String,
+        ty: TypeExpr,
+        init: Expr,
+    },
+    Call {
+        name: String,
+        args: Vec<Expr>,
+    },
+}
+
+#[derive(Debug)]
+pub enum TypeExpr {
+    UInt(u32),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -21,6 +34,7 @@ pub enum BinOp {
 pub enum Expr {
     StringLit(String),
     IntLit(i64),
+    Ident(String),
     BinaryOp {
         op: BinOp,
         left: Box<Expr>,

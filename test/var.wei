@@ -1,0 +1,2 @@
+let n uint(3) = 42
+print(n)
