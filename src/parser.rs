@@ -39,8 +39,18 @@ impl<'a> Parser<'a> {
             if name == "let" {
                 return self.parse_let();
             }
+            if matches!(self.tokens.get(self.pos + 1), Some(Token::Eq)) {
+                return self.parse_assign();
+            }
         }
         self.parse_call()
+    }
+
+    fn parse_assign(&mut self) -> Stmt {
+        let name = self.expect_ident();
+        self.expect_eq();
+        let value = self.parse_expr();
+        Stmt::Assign { name, value }
     }
 
     fn parse_let(&mut self) -> Stmt {

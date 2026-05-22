@@ -78,6 +78,7 @@ impl Codegen {
     fn emit_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Let { .. } => {}
+            Stmt::Assign { name, value } => self.emit_assign(name, value),
             Stmt::Call { name, args } if name == "print" => {
                 if args.len() != 1 {
                     panic!("codegen: print() takes exactly one argument");
@@ -90,19 +91,23 @@ impl Codegen {
         }
     }
 
+    fn emit_assign(&mut self, name: &str, value: &Expr) {
+        self.emit_expr(value);
+        let offset = self.lookup_symbol(name).offset_in_data;
+        self.emit_mov_imm64_reloc(RBX, offset);
+        self.emit_mov_at_rbx_rax();
+    }
+
     fn emit_print(&mut self, arg: &Expr) {
-        match arg {
-            Expr::Ident(name) => {
-                let offset = self.lookup_symbol(name).offset_in_data;
-                self.emit_print_var(offset);
-            }
-            _ => {
-                let s = match eval_const(arg) {
-                    ConstValue::Str(s) => s,
-                    ConstValue::Int(n) => n.to_string(),
-                };
-                self.emit_print_const(s);
-            }
+        if let Some(c) = try_eval_const(arg) {
+            let s = match c {
+                ConstValue::Str(s) => s,
+                ConstValue::Int(n) => n.to_string(),
+            };
+            self.emit_print_const(s);
+        } else {
+            self.emit_expr(arg);
+            self.emit_print_rax_int();
         }
     }
 
@@ -119,10 +124,7 @@ impl Codegen {
         self.emit_syscall();
     }
 
-    fn emit_print_var(&mut self, var_offset: u64) {
-        self.emit_mov_imm64_reloc(RBX, var_offset);
-        self.emit_mov_rax_from_rbx();
-
+    fn emit_print_rax_int(&mut self) {
         self.emit_mov_imm64_reloc(RSI, SCRATCH_END);
         self.emit_mov_imm64(RCX, 10);
 
@@ -141,6 +143,43 @@ impl Codegen {
         self.emit_mov_imm64(RAX, SYS_WRITE);
         self.emit_mov_imm64(RDI, FD_STDOUT);
         self.emit_syscall();
+    }
+
+    fn emit_expr(&mut self, expr: &Expr) {
+        match expr {
+            Expr::IntLit(n) => {
+                self.emit_mov_imm64(RAX, *n as u64);
+            }
+            Expr::Ident(name) => {
+                let offset = self.lookup_symbol(name).offset_in_data;
+                self.emit_mov_imm64_reloc(RBX, offset);
+                self.emit_mov_rax_from_rbx();
+            }
+            Expr::BinaryOp { op, left, right } => {
+                self.emit_expr(left);
+                self.emit_push_rax();
+                self.emit_expr(right);
+                self.emit_mov_rbx_rax();
+                self.emit_pop_rax();
+                match op {
+                    BinOp::Add => self.emit_add_rax_rbx(),
+                    BinOp::Sub => self.emit_sub_rax_rbx(),
+                    BinOp::Mul => self.emit_imul_rax_rbx(),
+                    BinOp::Div => {
+                        self.emit_xor_rdx_rdx();
+                        self.emit_div_rbx();
+                    }
+                    BinOp::Mod => {
+                        self.emit_xor_rdx_rdx();
+                        self.emit_div_rbx();
+                        self.emit_mov_rax_rdx();
+                    }
+                }
+            }
+            Expr::StringLit(_) => {
+                panic!("codegen: string literals cannot appear in runtime expressions");
+            }
+        }
     }
 
     fn emit_exit(&mut self) {
@@ -184,6 +223,51 @@ impl Codegen {
     fn emit_mov_rax_from_rbx(&mut self) {
         // mov rax, [rbx]
         self.code.extend_from_slice(&[0x48, 0x8B, 0x03]);
+    }
+
+    fn emit_mov_at_rbx_rax(&mut self) {
+        // mov [rbx], rax
+        self.code.extend_from_slice(&[0x48, 0x89, 0x03]);
+    }
+
+    fn emit_mov_rbx_rax(&mut self) {
+        // mov rbx, rax
+        self.code.extend_from_slice(&[0x48, 0x89, 0xC3]);
+    }
+
+    fn emit_mov_rax_rdx(&mut self) {
+        // mov rax, rdx
+        self.code.extend_from_slice(&[0x48, 0x89, 0xD0]);
+    }
+
+    fn emit_push_rax(&mut self) {
+        // push rax
+        self.code.push(0x50);
+    }
+
+    fn emit_pop_rax(&mut self) {
+        // pop rax
+        self.code.push(0x58);
+    }
+
+    fn emit_add_rax_rbx(&mut self) {
+        // add rax, rbx
+        self.code.extend_from_slice(&[0x48, 0x01, 0xD8]);
+    }
+
+    fn emit_sub_rax_rbx(&mut self) {
+        // sub rax, rbx
+        self.code.extend_from_slice(&[0x48, 0x29, 0xD8]);
+    }
+
+    fn emit_imul_rax_rbx(&mut self) {
+        // imul rax, rbx
+        self.code.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC3]);
+    }
+
+    fn emit_div_rbx(&mut self) {
+        // div rbx (unsigned: rdx:rax / rbx)
+        self.code.extend_from_slice(&[0x48, 0xF7, 0xF3]);
     }
 
     fn emit_xor_rdx_rdx(&mut self) {
@@ -250,15 +334,23 @@ impl ConstValue {
 }
 
 fn eval_const(expr: &Expr) -> ConstValue {
+    try_eval_const(expr).unwrap_or_else(|| panic!("codegen: expression is not a constant"))
+}
+
+fn try_eval_const(expr: &Expr) -> Option<ConstValue> {
     match expr {
-        Expr::StringLit(s) => ConstValue::Str(s.clone()),
-        Expr::IntLit(n) => ConstValue::Int(*n),
-        Expr::Ident(name) => {
-            panic!("codegen: `{}` is not a constant expression", name)
-        }
+        Expr::StringLit(s) => Some(ConstValue::Str(s.clone())),
+        Expr::IntLit(n) => Some(ConstValue::Int(*n)),
+        Expr::Ident(_) => None,
         Expr::BinaryOp { op, left, right } => {
-            let l = eval_const(left).expect_int();
-            let r = eval_const(right).expect_int();
+            let l = match try_eval_const(left)? {
+                ConstValue::Int(n) => n,
+                _ => return None,
+            };
+            let r = match try_eval_const(right)? {
+                ConstValue::Int(n) => n,
+                _ => return None,
+            };
             let v = match op {
                 BinOp::Add => l + r,
                 BinOp::Sub => l - r,
@@ -276,7 +368,7 @@ fn eval_const(expr: &Expr) -> ConstValue {
                     l % r
                 }
             };
-            ConstValue::Int(v)
+            Some(ConstValue::Int(v))
         }
     }
 }

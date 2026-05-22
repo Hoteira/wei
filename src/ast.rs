@@ -10,6 +10,10 @@ pub enum Stmt {
         ty: TypeExpr,
         init: Expr,
     },
+    Assign {
+        name: String,
+        value: Expr,
+    },
     Call {
         name: String,
         args: Vec<Expr>,
