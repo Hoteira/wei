@@ -20,9 +20,13 @@ pub enum Token {
     Gt,
     GtEq,
     Bang,
+    AmpAmp,
+    PipePipe,
     Colon,
     Dot,
     DotDot,
+    DotDotEq,
+    FatArrow,
     Indent,
     Dedent,
     Newline,
@@ -120,6 +124,10 @@ pub fn lex(source: &str) -> Vec<Token> {
                     tokens.push(Token::EqEq);
                     i += 2;
                 }
+                b'=' if i + 1 < bytes.len() && bytes[i + 1] == b'>' => {
+                    tokens.push(Token::FatArrow);
+                    i += 2;
+                }
                 b'=' => {
                     tokens.push(Token::Eq);
                     i += 1;
@@ -131,6 +139,14 @@ pub fn lex(source: &str) -> Vec<Token> {
                 b'!' => {
                     tokens.push(Token::Bang);
                     i += 1;
+                }
+                b'&' if i + 1 < bytes.len() && bytes[i + 1] == b'&' => {
+                    tokens.push(Token::AmpAmp);
+                    i += 2;
+                }
+                b'|' if i + 1 < bytes.len() && bytes[i + 1] == b'|' => {
+                    tokens.push(Token::PipePipe);
+                    i += 2;
                 }
                 b'<' if i + 1 < bytes.len() && bytes[i + 1] == b'=' => {
                     tokens.push(Token::LtEq);
@@ -151,6 +167,10 @@ pub fn lex(source: &str) -> Vec<Token> {
                 b':' => {
                     tokens.push(Token::Colon);
                     i += 1;
+                }
+                b'.' if i + 2 < bytes.len() && bytes[i + 1] == b'.' && bytes[i + 2] == b'=' => {
+                    tokens.push(Token::DotDotEq);
+                    i += 3;
                 }
                 b'.' if i + 1 < bytes.len() && bytes[i + 1] == b'.' => {
                     tokens.push(Token::DotDot);

@@ -28,6 +28,15 @@ pub enum Stmt {
         cond: Expr,
         body: Vec<Stmt>,
     },
+    If {
+        cond: Expr,
+        then_body: Vec<Stmt>,
+        else_body: Vec<Stmt>,
+    },
+    Match {
+        expr: Expr,
+        arms: Vec<MatchArm>,
+    },
     Call {
         name: String,
         args: Vec<Expr>,
@@ -41,6 +50,19 @@ pub enum Stmt {
         path: String,
         mode: String,
     },
+}
+
+#[derive(Debug)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub body: Vec<Stmt>,
+}
+
+#[derive(Debug)]
+pub enum Pattern {
+    Lit(i64),
+    Range(i64, i64),
+    Wildcard,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +118,14 @@ pub enum Expr {
     },
     Not {
         inner: Box<Expr>,
+    },
+    And {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Or {
+        left: Box<Expr>,
+        right: Box<Expr>,
     },
     FieldAccess {
         base: Box<Expr>,

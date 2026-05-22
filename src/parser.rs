@@ -1,4 +1,4 @@
-use crate::ast::{BinOp, CmpOp, Expr, LValue, Program, Stmt, TypeExpr};
+use crate::ast::{BinOp, CmpOp, Expr, LValue, MatchArm, Pattern, Program, Stmt, TypeExpr};
 use crate::lexer::Token;
 
 pub fn parse(tokens: &[Token]) -> Program {
@@ -47,6 +47,12 @@ impl<'a> Parser<'a> {
             }
             if name == "while" {
                 return self.parse_while();
+            }
+            if name == "if" {
+                return self.parse_if();
+            }
+            if name == "match" {
+                return self.parse_match();
             }
             if name == "type" {
                 return self.parse_typedef();
@@ -114,6 +120,100 @@ impl<'a> Parser<'a> {
             };
         }
         lv
+    }
+
+    fn parse_match(&mut self) -> Stmt {
+        self.pos += 1; // consume "match"
+        let expr = self.parse_expr();
+        self.expect_colon();
+        self.skip_newlines();
+        self.expect_indent();
+        let mut arms = Vec::new();
+        while !matches!(self.peek(), Token::Dedent | Token::Eof) {
+            let pattern = self.parse_pattern();
+            self.expect_fat_arrow();
+            let body = self.parse_arm_body();
+            arms.push(MatchArm { pattern, body });
+            self.skip_newlines();
+        }
+        self.expect_dedent();
+        Stmt::Match { expr, arms }
+    }
+
+    fn parse_pattern(&mut self) -> Pattern {
+        match self.peek().clone() {
+            Token::Ident(n) if n == "_" => {
+                self.pos += 1;
+                Pattern::Wildcard
+            }
+            Token::IntLit(lo) => {
+                self.pos += 1;
+                if matches!(self.peek(), Token::DotDotEq) {
+                    self.pos += 1;
+                    let hi = self.expect_intlit();
+                    Pattern::Range(lo, hi)
+                } else {
+                    Pattern::Lit(lo)
+                }
+            }
+            other => panic!("parse error: expected pattern, got {:?}", other),
+        }
+    }
+
+    fn parse_arm_body(&mut self) -> Vec<Stmt> {
+        if matches!(self.peek(), Token::Newline) {
+            self.skip_newlines();
+            self.expect_indent();
+            let mut body = Vec::new();
+            while !matches!(self.peek(), Token::Dedent | Token::Eof) {
+                body.push(self.parse_statement());
+                self.skip_newlines();
+            }
+            self.expect_dedent();
+            body
+        } else {
+            vec![self.parse_statement()]
+        }
+    }
+
+    fn expect_fat_arrow(&mut self) {
+        let t = self.tokens[self.pos].clone();
+        self.pos += 1;
+        if !matches!(t, Token::FatArrow) {
+            panic!("parse error: expected '=>', got {:?}", t);
+        }
+    }
+
+    fn parse_if(&mut self) -> Stmt {
+        self.pos += 1; // consume "if"
+        let cond = self.parse_expr();
+        self.expect_colon();
+        self.skip_newlines();
+        self.expect_indent();
+        let mut then_body = Vec::new();
+        while !matches!(self.peek(), Token::Dedent | Token::Eof) {
+            then_body.push(self.parse_statement());
+            self.skip_newlines();
+        }
+        self.expect_dedent();
+        let mut else_body = Vec::new();
+        self.skip_newlines();
+        if matches!(self.peek(), Token::Ident(n) if n == "else") {
+            self.pos += 1;
+            self.expect_colon();
+            self.skip_newlines();
+            self.expect_indent();
+            while !matches!(self.peek(), Token::Dedent | Token::Eof) {
+                else_body.push(self.parse_statement());
+                self.skip_newlines();
+            }
+            self.expect_dedent();
+        }
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        }
     }
 
     fn parse_while(&mut self) -> Stmt {
@@ -245,6 +345,36 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr(&mut self) -> Expr {
+        self.parse_or()
+    }
+
+    fn parse_or(&mut self) -> Expr {
+        let mut left = self.parse_and();
+        while matches!(self.peek(), Token::PipePipe) {
+            self.pos += 1;
+            let right = self.parse_and();
+            left = Expr::Or {
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        left
+    }
+
+    fn parse_and(&mut self) -> Expr {
+        let mut left = self.parse_cmp();
+        while matches!(self.peek(), Token::AmpAmp) {
+            self.pos += 1;
+            let right = self.parse_cmp();
+            left = Expr::And {
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        left
+    }
+
+    fn parse_cmp(&mut self) -> Expr {
         let left = self.parse_additive();
         if let Some(op) = self.peek_cmp_op() {
             self.pos += 1;

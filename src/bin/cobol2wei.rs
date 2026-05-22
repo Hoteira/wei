@@ -174,6 +174,8 @@ enum CmpOp {
 enum Cond {
     Cmp { op: CmpOp, left: Expr, right: Expr },
     Bare(String),
+    And(Box<Cond>, Box<Cond>),
+    Or(Box<Cond>, Box<Cond>),
 }
 
 #[derive(Debug)]
@@ -184,10 +186,29 @@ enum Stmt {
     Subtract { value: Expr, target: String },
     Perform { para: String },
     PerformUntil { cond: Cond, body: Vec<Stmt> },
+    If {
+        cond: Cond,
+        then_body: Vec<Stmt>,
+        else_body: Vec<Stmt>,
+    },
     Open { mode: String, file: String },
     Read { file: String, at_end_target: Option<String> },
     Close { file: String },
+    Evaluate { expr: Expr, arms: Vec<EvalArm> },
     StopRun,
+}
+
+#[derive(Debug)]
+enum EvalPattern {
+    Lit(i64),
+    Thru(i64, i64),
+    Other,
+}
+
+#[derive(Debug)]
+struct EvalArm {
+    pattern: EvalPattern,
+    body: Vec<Stmt>,
 }
 
 #[derive(Debug)]
@@ -686,6 +707,87 @@ impl<'a> Parser<'a> {
                     at_end_target,
                 }
             }
+            Token::Word(ref w) if w == "IF" => {
+                self.advance();
+                let cond = self.parse_condition();
+                if matches!(self.peek(), Token::Word(w) if w == "THEN") {
+                    self.advance();
+                }
+                let mut then_body = Vec::new();
+                loop {
+                    match self.peek() {
+                        Token::Word(w) if w == "ELSE" || w == "END-IF" => break,
+                        Token::Eof => panic!("cobol2wei: unterminated IF (missing END-IF)"),
+                        _ => then_body.push(self.parse_statement(true)),
+                    }
+                }
+                let mut else_body = Vec::new();
+                if matches!(self.peek(), Token::Word(w) if w == "ELSE") {
+                    self.advance();
+                    loop {
+                        match self.peek() {
+                            Token::Word(w) if w == "END-IF" => break,
+                            Token::Eof => panic!("cobol2wei: unterminated IF (missing END-IF)"),
+                            _ => else_body.push(self.parse_statement(true)),
+                        }
+                    }
+                }
+                self.expect_word("END-IF");
+                self.end_stmt(in_block);
+                Stmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                }
+            }
+            Token::Word(ref w) if w == "EVALUATE" => {
+                self.advance();
+                let expr = self.parse_expr();
+                let mut arms: Vec<EvalArm> = Vec::new();
+                loop {
+                    match self.peek() {
+                        Token::Word(w) if w == "WHEN" => {
+                            self.advance();
+                            let pattern = if matches!(self.peek(), Token::Word(w) if w == "OTHER")
+                            {
+                                self.advance();
+                                EvalPattern::Other
+                            } else {
+                                let lo = self.expect_intlit();
+                                if matches!(self.peek(), Token::Word(w) if w == "THRU" || w == "THROUGH")
+                                {
+                                    self.advance();
+                                    let hi = self.expect_intlit();
+                                    EvalPattern::Thru(lo, hi)
+                                } else {
+                                    EvalPattern::Lit(lo)
+                                }
+                            };
+                            let mut body = Vec::new();
+                            loop {
+                                match self.peek() {
+                                    Token::Word(w) if w == "WHEN" || w == "END-EVALUATE" => break,
+                                    Token::Eof => panic!(
+                                        "cobol2wei: unterminated EVALUATE (missing END-EVALUATE)"
+                                    ),
+                                    _ => body.push(self.parse_statement(true)),
+                                }
+                            }
+                            arms.push(EvalArm { pattern, body });
+                        }
+                        Token::Word(w) if w == "END-EVALUATE" => break,
+                        Token::Eof => {
+                            panic!("cobol2wei: unterminated EVALUATE (missing END-EVALUATE)")
+                        }
+                        other => {
+                            panic!("cobol2wei: expected WHEN or END-EVALUATE, got {:?}", other)
+                        }
+                    }
+                }
+                self.expect_word("END-EVALUATE");
+                self.end_stmt(in_block);
+                Stmt::Evaluate { expr, arms }
+            }
             Token::Word(ref w) if w == "STOP" => {
                 self.advance();
                 self.expect_word("RUN");
@@ -711,6 +813,26 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_condition(&mut self) -> Cond {
+        let mut left = self.parse_and_cond();
+        while matches!(self.peek(), Token::Word(w) if w == "OR") {
+            self.advance();
+            let right = self.parse_and_cond();
+            left = Cond::Or(Box::new(left), Box::new(right));
+        }
+        left
+    }
+
+    fn parse_and_cond(&mut self) -> Cond {
+        let mut left = self.parse_atom_cond();
+        while matches!(self.peek(), Token::Word(w) if w == "AND") {
+            self.advance();
+            let right = self.parse_atom_cond();
+            left = Cond::And(Box::new(left), Box::new(right));
+        }
+        left
+    }
+
+    fn parse_atom_cond(&mut self) -> Cond {
         let left = self.parse_expr();
         let mut negated = false;
         if matches!(self.peek(), Token::Word(w) if w == "NOT") {
@@ -832,6 +954,11 @@ fn is_verb(w: &str) -> bool {
             | "EVALUATE"
             | "COMPUTE"
             | "SET"
+            | "WHEN"
+            | "END-EVALUATE"
+            | "END-IF"
+            | "END-PERFORM"
+            | "END-READ"
     )
 }
 
@@ -966,6 +1093,8 @@ fn cond_wei(c: &Cond, r: &Resolved) -> String {
                 );
             }
         }
+        Cond::And(l, rr) => format!("({}) && ({})", cond_wei(l, r), cond_wei(rr, r)),
+        Cond::Or(l, rr) => format!("({}) || ({})", cond_wei(l, r), cond_wei(rr, r)),
     }
 }
 
@@ -978,6 +1107,8 @@ fn cond_cobol(c: &Cond) -> String {
             expr_cobol(right)
         ),
         Cond::Bare(n) => to_cobol_name(n),
+        Cond::And(l, r) => format!("{} AND {}", cond_cobol(l), cond_cobol(r)),
+        Cond::Or(l, r) => format!("{} OR {}", cond_cobol(l), cond_cobol(r)),
     }
 }
 
@@ -1132,6 +1263,27 @@ fn emit_stmt(out: &mut String, s: &Stmt, indent: usize, r: &Resolved) {
                 emit_stmt(out, s, indent + 1, r);
             }
         }
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            out.push_str(&format!(
+                "{}// COBOL: IF {} ...\n",
+                pad,
+                cond_cobol(cond)
+            ));
+            out.push_str(&format!("{}if {}:\n", pad, cond_wei(cond, r)));
+            for s in then_body {
+                emit_stmt(out, s, indent + 1, r);
+            }
+            if !else_body.is_empty() {
+                out.push_str(&format!("{}else:\n", pad));
+                for s in else_body {
+                    emit_stmt(out, s, indent + 1, r);
+                }
+            }
+        }
         Stmt::Open { mode, file } => {
             out.push_str(&format!(
                 "{}// COBOL: OPEN {} {}.\n",
@@ -1163,6 +1315,38 @@ fn emit_stmt(out: &mut String, s: &Stmt, indent: usize, r: &Resolved) {
                 panic!("cobol2wei: READ {} has no FD record binding", file)
             });
             out.push_str(&format!("{}read({}, {})\n", pad, file, rec));
+        }
+        Stmt::Evaluate { expr, arms } => {
+            out.push_str(&format!(
+                "{}// COBOL: EVALUATE {} ...\n",
+                pad,
+                expr_cobol(expr)
+            ));
+            out.push_str(&format!("{}match {}:\n", pad, expr_wei(expr, r)));
+            let arm_pad = "    ".repeat(indent + 1);
+            for arm in arms {
+                match &arm.pattern {
+                    EvalPattern::Lit(v) => {
+                        out.push_str(&format!("{}// COBOL: WHEN {}\n", arm_pad, v));
+                        out.push_str(&format!("{}{} =>\n", arm_pad, v));
+                    }
+                    EvalPattern::Thru(lo, hi) => {
+                        out.push_str(&format!("{}// COBOL: WHEN {} THRU {}\n", arm_pad, lo, hi));
+                        out.push_str(&format!("{}{}..={} =>\n", arm_pad, lo, hi));
+                    }
+                    EvalPattern::Other => {
+                        out.push_str(&format!("{}// COBOL: WHEN OTHER\n", arm_pad));
+                        out.push_str(&format!("{}_ =>\n", arm_pad));
+                    }
+                }
+                if arm.body.is_empty() {
+                    out.push_str(&format!("{}    print(0)\n", arm_pad));
+                } else {
+                    for s in &arm.body {
+                        emit_stmt(out, s, indent + 2, r);
+                    }
+                }
+            }
         }
         Stmt::StopRun => {
             out.push_str(&format!("{}// COBOL: STOP RUN.\n", pad));

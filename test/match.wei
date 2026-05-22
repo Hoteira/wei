@@ -1,0 +1,15 @@
+let x uint(3) = 7
+
+par main:
+    match x:
+        1 => print(1)
+        2..=5 => print(2)
+        6..=10 => print(3)
+        _ => print(9)
+    match x:
+        7 =>
+            print(4)
+            print(5)
+        _ => print(9)
+
+main()

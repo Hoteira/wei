@@ -1,4 +1,4 @@
-use crate::ast::{BinOp, CmpOp, Expr, LValue, Program, Stmt, TypeExpr};
+use crate::ast::{BinOp, CmpOp, Expr, LValue, MatchArm, Pattern, Program, Stmt, TypeExpr};
 use crate::elf::ENTRY_VMA;
 use std::collections::HashMap;
 
@@ -403,6 +403,12 @@ impl Codegen {
                 var, start, end, body,
             } => self.emit_for(var, start, end, body),
             Stmt::While { cond, body } => self.emit_while(cond, body),
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => self.emit_if(cond, then_body, else_body),
+            Stmt::Match { expr, arms } => self.emit_match(expr, arms),
             Stmt::Call { name, args } => {
                 if name == "print" {
                     if args.len() != 1 {
@@ -424,6 +430,83 @@ impl Codegen {
                     panic!("codegen: unknown function `{}`", name);
                 }
             }
+        }
+    }
+
+    fn emit_match(&mut self, expr: &Expr, arms: &[MatchArm]) {
+        self.emit_expr(expr);
+        self.emit_push_rax();
+        let mut end_jumps = Vec::new();
+        let mut wildcard_body: Option<&[Stmt]> = None;
+        for arm in arms {
+            if matches!(arm.pattern, Pattern::Wildcard) {
+                wildcard_body = Some(&arm.body);
+                continue;
+            }
+            self.emit_mov_rbx_from_rsp_off(0);
+            self.emit_mov_rax_rbx();
+            let skip_positions = match arm.pattern {
+                Pattern::Lit(v) => {
+                    self.emit_mov_imm64(RBX, v as u64);
+                    self.emit_cmp_rax_rbx();
+                    vec![self.emit_jne_placeholder()]
+                }
+                Pattern::Range(lo, hi) => {
+                    self.emit_mov_imm64(RBX, lo as u64);
+                    self.emit_cmp_rax_rbx();
+                    let jl = self.emit_jl_placeholder();
+                    self.emit_mov_imm64(RBX, hi as u64);
+                    self.emit_cmp_rax_rbx();
+                    let jg = self.emit_jg_placeholder();
+                    vec![jl, jg]
+                }
+                Pattern::Wildcard => unreachable!(),
+            };
+            for s in &arm.body {
+                self.emit_stmt(s);
+            }
+            end_jumps.push(self.emit_jmp_placeholder());
+            let next = self.code.len();
+            for p in skip_positions {
+                self.patch_rel32(p, next);
+            }
+        }
+        if let Some(body) = wildcard_body {
+            for s in body {
+                self.emit_stmt(s);
+            }
+        }
+        let end = self.code.len();
+        for p in end_jumps {
+            self.patch_rel32(p, end);
+        }
+        self.emit_add_rsp_imm8(8);
+    }
+
+    fn emit_mov_rax_rbx(&mut self) {
+        // mov rax, rbx
+        self.code.extend_from_slice(&[0x48, 0x89, 0xD8]);
+    }
+
+    fn emit_if(&mut self, cond: &Expr, then_body: &[Stmt], else_body: &[Stmt]) {
+        self.emit_expr(cond);
+        self.emit_test_rax_rax();
+        let jz_pos = self.emit_jz_placeholder();
+        for s in then_body {
+            self.emit_stmt(s);
+        }
+        if else_body.is_empty() {
+            let end = self.code.len();
+            self.patch_rel32(jz_pos, end);
+        } else {
+            let jmp_pos = self.emit_jmp_placeholder();
+            let else_start = self.code.len();
+            self.patch_rel32(jz_pos, else_start);
+            for s in else_body {
+                self.emit_stmt(s);
+            }
+            let end = self.code.len();
+            self.patch_rel32(jmp_pos, end);
         }
     }
 
@@ -690,6 +773,22 @@ impl Codegen {
                 self.emit_test_rax_rax();
                 self.emit_setcc_dl_eq_zero();
                 self.emit_movzx_eax_dl();
+            }
+            Expr::And { left, right } => {
+                self.emit_expr(left);
+                self.emit_test_rax_rax();
+                let skip = self.emit_jz_placeholder();
+                self.emit_expr(right);
+                let end = self.code.len();
+                self.patch_rel32(skip, end);
+            }
+            Expr::Or { left, right } => {
+                self.emit_expr(left);
+                self.emit_test_rax_rax();
+                let skip = self.emit_jnz_placeholder();
+                self.emit_expr(right);
+                let end = self.code.len();
+                self.patch_rel32(skip, end);
             }
             Expr::Call { name, args } => {
                 if name == "at_end" {
@@ -961,6 +1060,41 @@ impl Codegen {
         pos
     }
 
+    fn emit_jmp_placeholder(&mut self) -> usize {
+        // jmp rel32: E9 + 4-byte placeholder
+        self.code.push(0xE9);
+        let pos = self.code.len();
+        self.code.extend_from_slice(&[0u8; 4]);
+        pos
+    }
+
+    fn emit_jnz_placeholder(&mut self) -> usize {
+        // jnz rel32: 0F 85 + 4-byte placeholder
+        self.code.push(0x0F);
+        self.code.push(0x85);
+        let pos = self.code.len();
+        self.code.extend_from_slice(&[0u8; 4]);
+        pos
+    }
+
+    fn emit_jl_placeholder(&mut self) -> usize {
+        // jl rel32 (signed less): 0F 8C + 4-byte placeholder
+        self.code.push(0x0F);
+        self.code.push(0x8C);
+        let pos = self.code.len();
+        self.code.extend_from_slice(&[0u8; 4]);
+        pos
+    }
+
+    fn emit_jg_placeholder(&mut self) -> usize {
+        // jg rel32 (signed greater): 0F 8F + 4-byte placeholder
+        self.code.push(0x0F);
+        self.code.push(0x8F);
+        let pos = self.code.len();
+        self.code.extend_from_slice(&[0u8; 4]);
+        pos
+    }
+
     fn emit_setcc_dl(&mut self, op: CmpOp) {
         // setcc r/m8: 0F 9X + ModRM (mod=11 reg=000 rm=010 → dl) = C2
         let opcode = match op {
@@ -1077,6 +1211,8 @@ fn try_eval_const(expr: &Expr) -> Option<ConstValue> {
         | Expr::Ident(_)
         | Expr::Compare { .. }
         | Expr::Not { .. }
+        | Expr::And { .. }
+        | Expr::Or { .. }
         | Expr::FieldAccess { .. }
         | Expr::Call { .. } => None,
         Expr::BinaryOp { op, left, right } => {

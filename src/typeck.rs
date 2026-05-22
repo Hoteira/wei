@@ -115,6 +115,19 @@ impl Checker {
             Stmt::While { body, .. } => {
                 self.check_block(body);
             }
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                self.check_block(then_body);
+                self.check_block(else_body);
+            }
+            Stmt::Match { arms, .. } => {
+                for arm in arms {
+                    self.check_block(&arm.body);
+                }
+            }
             Stmt::For { var, body, .. } => {
                 if self.symbols.contains_key(var) {
                     self.errors.push(format!(
@@ -247,6 +260,8 @@ fn try_const_int(expr: &Expr) -> Option<i64> {
         | Expr::StringLit(_)
         | Expr::Compare { .. }
         | Expr::Not { .. }
+        | Expr::And { .. }
+        | Expr::Or { .. }
         | Expr::FieldAccess { .. }
         | Expr::Call { .. } => None,
         Expr::BinaryOp { op, left, right } => {
