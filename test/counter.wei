@@ -1,0 +1,8 @@
+let n uint(3) = 0
+
+par main:
+    for _ in 0..5:
+        n = n + 1
+        print(n)
+
+main()

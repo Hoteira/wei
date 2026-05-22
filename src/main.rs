@@ -7,6 +7,7 @@ mod codegen;
 mod elf;
 mod lexer;
 mod parser;
+mod typeck;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -25,6 +26,14 @@ fn main() {
 
     let tokens = lexer::lex(&source);
     let program = parser::parse(&tokens);
+
+    if let Err(errors) = typeck::check(&program) {
+        for e in &errors {
+            eprintln!("wei: type error: {}", e);
+        }
+        process::exit(1);
+    }
+
     let segment = codegen::emit(&program);
 
     if let Err(e) = elf::write_elf(&output_path, &segment) {

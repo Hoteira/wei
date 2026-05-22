@@ -30,7 +30,7 @@ pub enum Stmt {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum TypeExpr {
     UInt(u32),
 }
