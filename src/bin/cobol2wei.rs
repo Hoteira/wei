@@ -244,9 +244,12 @@ enum Stmt {
     },
     Open { mode: String, file: String },
     Read { file: String, at_end_target: Option<String> },
+    Write { rec: String },
     Close { file: String },
     Evaluate { expr: Expr, arms: Vec<EvalArm> },
     CallSub { name: String, args: Vec<Expr> },
+    InspectTally { subject: String, counter: String, needle: String },
+    Goto { label: String },
     ExitProgram,
     StopRun,
 }
@@ -1023,6 +1026,14 @@ impl<'a> Parser<'a> {
                     file: to_wei_ident(&file),
                 }
             }
+            Token::Word(ref w) if w == "WRITE" => {
+                self.advance();
+                let rec_cobol = self.expect_word_any();
+                self.end_stmt(in_block);
+                Stmt::Write {
+                    rec: to_wei_ident(&rec_cobol),
+                }
+            }
             Token::Word(ref w) if w == "READ" => {
                 self.advance();
                 let file = self.expect_word_any();
@@ -1119,6 +1130,36 @@ impl<'a> Parser<'a> {
                 self.expect_word("END-EVALUATE");
                 self.end_stmt(in_block);
                 Stmt::Evaluate { expr, arms }
+            }
+            Token::Word(ref w) if w == "INSPECT" => {
+                self.advance();
+                let subject = self.expect_word_any();
+                self.expect_word("TALLYING");
+                let counter = self.expect_word_any();
+                self.expect_word("FOR");
+                self.expect_word("ALL");
+                let needle = match self.advance() {
+                    Token::StringLit(s) => s,
+                    other => panic!(
+                        "cobol2wei: INSPECT FOR ALL expected string literal, got {:?}",
+                        other
+                    ),
+                };
+                self.end_stmt(in_block);
+                Stmt::InspectTally {
+                    subject: to_wei_ident(&subject),
+                    counter: to_wei_ident(&counter),
+                    needle,
+                }
+            }
+            Token::Word(ref w) if w == "GO" => {
+                self.advance();
+                self.expect_word("TO");
+                let target = self.expect_word_any();
+                self.end_stmt(in_block);
+                Stmt::Goto {
+                    label: to_wei_ident(&target),
+                }
             }
             Token::Word(ref w) if w == "STOP" => {
                 self.advance();
@@ -1410,6 +1451,9 @@ fn is_verb(w: &str) -> bool {
             | "CLOSE"
             | "READ"
             | "WRITE"
+            | "REWRITE"
+            | "GO"
+            | "INSPECT"
             | "IF"
             | "EVALUATE"
             | "COMPUTE"
@@ -1428,6 +1472,7 @@ fn is_verb(w: &str) -> bool {
 struct Resolved {
     field_owner: HashMap<String, String>,
     fd_record: HashMap<String, String>,
+    record_to_file: HashMap<String, String>,
     eof_flag_for_file: HashMap<String, String>,
     eighty_eight_parent: HashMap<String, String>,
     file_for_eighty_eight: HashMap<String, String>,
@@ -1438,6 +1483,8 @@ fn resolve(program: &Program) -> Resolved {
     let mut r = Resolved::default();
     for fd in &program.fds {
         r.fd_record.insert(fd.file_name.clone(), fd.record_var.clone());
+        r.record_to_file
+            .insert(fd.record_var.clone(), fd.file_name.clone());
     }
     for rec in &program.records {
         if rec.var_name.starts_with("__inner_") {
@@ -1892,6 +1939,13 @@ fn emit_stmt(out: &mut String, s: &Stmt, indent: usize, r: &Resolved) {
             ));
             out.push_str(&format!("{}open({}, {})\n", pad, file, mode));
         }
+        Stmt::Write { rec } => {
+            let file = r.record_to_file.get(rec).unwrap_or_else(|| {
+                panic!("cobol2wei: WRITE `{}` has no FD binding", to_cobol_name(rec))
+            });
+            out.push_str(&format!("{}// COBOL: WRITE {}.\n", pad, to_cobol_name(rec)));
+            out.push_str(&format!("{}write({}, {})\n", pad, file, rec));
+        }
         Stmt::Close { file } => {
             out.push_str(&format!("{}// COBOL: CLOSE {}.\n", pad, to_cobol_name(file)));
             out.push_str(&format!("{}close({})\n", pad, file));
@@ -1961,6 +2015,30 @@ fn emit_stmt(out: &mut String, s: &Stmt, indent: usize, r: &Resolved) {
                 arg_str_cobol.join(", ")
             ));
             out.push_str(&format!("{}{}({})\n", pad, name, arg_str.join(", ")));
+        }
+        Stmt::InspectTally {
+            subject,
+            counter,
+            needle,
+        } => {
+            out.push_str(&format!(
+                "{}// COBOL: INSPECT {} TALLYING {} FOR ALL \"{}\".\n",
+                pad,
+                to_cobol_name(subject),
+                to_cobol_name(counter),
+                needle
+            ));
+            out.push_str(&format!(
+                "{}{} = count_chars({}, \"{}\")\n",
+                pad,
+                qualified(counter, r),
+                qualified(subject, r),
+                needle
+            ));
+        }
+        Stmt::Goto { label } => {
+            out.push_str(&format!("{}// COBOL: GO TO {}.\n", pad, to_cobol_name(label)));
+            out.push_str(&format!("{}goto {}\n", pad, label));
         }
         Stmt::ExitProgram => {
             out.push_str(&format!("{}// COBOL: EXIT PROGRAM.\n", pad));

@@ -1,0 +1,12 @@
+let small udec(9,2) = 1234.56
+let med udec(11,2) = 1234567.89
+let big udec(15,2) = 1234567890123.45
+
+par main:
+    print_money(small)
+    print("|")
+    print_money(med)
+    print("|")
+    print_money(big)
+
+main()

@@ -1,0 +1,12 @@
+let name str(20) = "Anna banana"
+let n uint(3) = 0
+
+par main:
+    n = count_chars(name, "a")
+    print(n)
+    n = count_chars(name, "A")
+    print(n)
+    n = count_chars(name, "z")
+    print(n)
+
+main()

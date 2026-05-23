@@ -134,6 +134,7 @@ impl Checker {
                     self.check_block(&arm.body);
                 }
             }
+            Stmt::Goto { .. } => {}
             Stmt::For { var, body, .. } => {
                 let existed = self.symbols.contains_key(var);
                 if !existed {

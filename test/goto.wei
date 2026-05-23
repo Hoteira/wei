@@ -1,0 +1,13 @@
+let n uint(3) = 1
+
+par main:
+    print(1)
+    if n == 1:
+        goto skip_me
+    print(9)
+
+par skip_me:
+    print(2)
+    print(3)
+
+main()

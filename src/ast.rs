@@ -38,6 +38,9 @@ pub enum Stmt {
         expr: Expr,
         arms: Vec<MatchArm>,
     },
+    Goto {
+        label: String,
+    },
     Call {
         name: String,
         args: Vec<Expr>,

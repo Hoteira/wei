@@ -57,6 +57,11 @@ impl<'a> Parser<'a> {
             if name == "match" {
                 return self.parse_match();
             }
+            if name == "goto" {
+                self.pos += 1;
+                let label = self.expect_ident();
+                return Stmt::Goto { label };
+            }
             if name == "type" {
                 return self.parse_typedef();
             }

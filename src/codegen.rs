@@ -380,6 +380,29 @@ impl Codegen {
         self.emit_syscall();
     }
 
+    fn emit_file_write(&mut self, args: &[Expr]) {
+        if args.len() != 2 {
+            panic!("codegen: write() takes 2 args");
+        }
+        let file_name = match &args[0] {
+            Expr::Ident(n) => n.clone(),
+            _ => panic!("codegen: write() first arg must be a file ident"),
+        };
+        let rec_name = match &args[1] {
+            Expr::Ident(n) => n.clone(),
+            _ => panic!("codegen: write() second arg must be a record ident"),
+        };
+        let fd_off = self.file_fd_offset(&file_name);
+        let rec_offset = self.lookup_symbol(&rec_name).offset_in_data;
+        let rec_size = self.record_size_of(&rec_name);
+        self.emit_mov_imm64_reloc(RBX, fd_off);
+        self.emit_mov_rdi_from_rbx();
+        self.emit_mov_imm64(RAX, 1); // sys_write
+        self.emit_mov_imm64_reloc(RSI, rec_offset);
+        self.emit_mov_imm64(RDX, rec_size);
+        self.emit_syscall();
+    }
+
     fn emit_file_read(&mut self, args: &[Expr]) {
         if args.len() != 2 {
             panic!("codegen: read() takes 2 args");
@@ -493,6 +516,45 @@ impl Codegen {
         self.patch_rel32(exit_jump, end);
     }
 
+    fn emit_count_chars(&mut self, args: &[Expr]) {
+        if args.len() != 2 {
+            panic!("codegen: count_chars() takes 2 args");
+        }
+        let (str_off, str_width) = {
+            let (off, ty) = self.resolve_expr_address(&args[0]);
+            match ty {
+                TypeExpr::Str(w) => (off, w),
+                _ => panic!("codegen: count_chars first arg must be a str-typed variable"),
+            }
+        };
+        let needle = match &args[1] {
+            Expr::StringLit(s) if s.len() == 1 => s.as_bytes()[0],
+            _ => panic!("codegen: count_chars second arg must be a single-char string literal"),
+        };
+
+        self.emit_mov_imm64_reloc(RSI, str_off);
+        self.emit_mov_imm64(RCX, str_width as u64);
+        self.emit_xor_rdx_rdx();
+
+        let loop_start = self.code.len();
+
+        // cmp byte [rsi], imm8
+        self.code.extend_from_slice(&[0x80, 0x3E, needle]);
+        let jne_skip = self.emit_jne_placeholder();
+        // inc rdx
+        self.code.extend_from_slice(&[0x48, 0xFF, 0xC2]);
+        let skip = self.code.len();
+        self.patch_rel32(jne_skip, skip);
+        // inc rsi
+        self.code.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+        // dec rcx
+        self.code.extend_from_slice(&[0x48, 0xFF, 0xC9]);
+        self.emit_jnz_rel32_back_to(loop_start);
+
+        // mov rax, rdx
+        self.emit_mov_rax_rdx();
+    }
+
     fn emit_at_end(&mut self, args: &[Expr]) {
         if args.len() != 1 {
             panic!("codegen: at_end() takes 1 arg");
@@ -533,6 +595,16 @@ impl Codegen {
 
     fn emit_call_paragraph(&mut self, name: &str) {
         self.code.push(0xE8);
+        let pos = self.code.len();
+        self.code.extend_from_slice(&[0u8; 4]);
+        self.par_calls.push((pos, name.to_string()));
+    }
+
+    fn emit_goto(&mut self, name: &str) {
+        if !self.paragraphs.iter().any(|(n, _)| n == name) {
+            panic!("codegen: goto target `{}` is not a defined paragraph or sub", name);
+        }
+        self.code.push(0xE9); // jmp rel32
         let pos = self.code.len();
         self.code.extend_from_slice(&[0u8; 4]);
         self.par_calls.push((pos, name.to_string()));
@@ -680,18 +752,32 @@ impl Codegen {
                 else_body,
             } => self.emit_if(cond, then_body, else_body),
             Stmt::Match { expr, arms } => self.emit_match(expr, arms),
+            Stmt::Goto { label } => self.emit_goto(label),
             Stmt::Call { name, args } => {
                 if name == "print" {
                     if args.len() != 1 {
                         panic!("codegen: print() takes exactly one argument");
                     }
                     self.emit_print(&args[0]);
+                } else if name == "print_money" {
+                    if args.len() != 1 {
+                        panic!("codegen: print_money() takes exactly one argument");
+                    }
+                    let scale = self
+                        .try_resolve_decimal_ident(&args[0])
+                        .unwrap_or_else(|| {
+                            panic!("codegen: print_money requires a decimal-typed argument")
+                        });
+                    self.emit_expr(&args[0]);
+                    self.emit_print_rax_money(scale);
                 } else if name == "open" {
                     self.emit_file_open(args);
                 } else if name == "close" {
                     self.emit_file_close(args);
                 } else if name == "read" {
                     self.emit_file_read(args);
+                } else if name == "write" {
+                    self.emit_file_write(args);
                 } else if self.is_sub(name) {
                     self.emit_call_sub(name, args);
                 } else if self.has_paragraph(name) {
@@ -1109,6 +1195,77 @@ impl Codegen {
         self.emit_syscall();
     }
 
+    fn emit_print_rax_money(&mut self, scale: u32) {
+        self.emit_mov_imm64_reloc(RSI, SCRATCH_END);
+        self.emit_mov_imm64(RCX, 10);
+        self.emit_mov_imm64(RDI, 0);
+        self.emit_mov_imm64(RBX, 0);
+
+        let loop_start = self.code.len();
+
+        // Comma check: if rdi >= scale && rbx == 3, write ',', set rbx = 0
+        self.emit_cmp_rdi_imm8(scale as u8);
+        let jl_skip_comma = self.emit_jl_placeholder();
+        self.emit_cmp_rbx_imm8(3);
+        let jne_skip_comma = self.emit_jne_placeholder();
+        self.emit_dec_rsi();
+        self.emit_mov_byte_at_rsi_imm(b',');
+        self.emit_xor_rbx_rbx();
+        let after_comma = self.code.len();
+        self.patch_rel32(jl_skip_comma, after_comma);
+        self.patch_rel32(jne_skip_comma, after_comma);
+
+        // Dot check
+        self.emit_cmp_rdi_imm8(scale as u8);
+        let jne_dot = self.emit_jne_placeholder();
+        self.emit_dec_rsi();
+        self.emit_mov_byte_at_rsi_imm(b'.');
+        let after_dot = self.code.len();
+        self.patch_rel32(jne_dot, after_dot);
+
+        // Digit write
+        self.emit_xor_rdx_rdx();
+        self.emit_div_rcx();
+        self.emit_add_rdx_imm8(0x30);
+        self.emit_dec_rsi();
+        self.emit_mov_at_rsi_dl();
+
+        // If we just wrote an integer digit (rdi >= scale), inc rbx
+        self.emit_cmp_rdi_imm8(scale as u8);
+        let jl_no_bump = self.emit_jl_placeholder();
+        self.emit_inc_rbx();
+        let after_bump = self.code.len();
+        self.patch_rel32(jl_no_bump, after_bump);
+
+        self.emit_inc_rdi();
+
+        self.emit_test_rax_rax();
+        self.emit_jnz_rel32_back_to(loop_start);
+        self.emit_cmp_rdi_imm8(scale as u8);
+        self.emit_jle_rel32_back_to(loop_start);
+
+        self.emit_mov_imm64_reloc(RDX, SCRATCH_END);
+        self.emit_sub_rdx_rsi();
+        self.emit_mov_imm64(RAX, SYS_WRITE);
+        self.emit_mov_imm64(RDI, FD_STDOUT);
+        self.emit_syscall();
+    }
+
+    fn emit_cmp_rbx_imm8(&mut self, imm: u8) {
+        // cmp rbx, imm8 (sign-extended)
+        self.code.extend_from_slice(&[0x48, 0x83, 0xFB, imm]);
+    }
+
+    fn emit_xor_rbx_rbx(&mut self) {
+        // xor rbx, rbx
+        self.code.extend_from_slice(&[0x48, 0x31, 0xDB]);
+    }
+
+    fn emit_inc_rbx(&mut self) {
+        // inc rbx
+        self.code.extend_from_slice(&[0x48, 0xFF, 0xC3]);
+    }
+
     fn emit_print_rax_int(&mut self) {
         self.emit_mov_imm64_reloc(RSI, SCRATCH_END);
         self.emit_mov_imm64(RCX, 10);
@@ -1262,6 +1419,8 @@ impl Codegen {
             Expr::Call { name, args } => {
                 if name == "at_end" {
                     self.emit_at_end(args);
+                } else if name == "count_chars" {
+                    self.emit_count_chars(args);
                 } else {
                     panic!("codegen: `{}` not callable in expression context", name);
                 }
