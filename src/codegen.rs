@@ -55,6 +55,7 @@ pub fn emit(program: &Program) -> Vec<u8> {
     g.finalize()
 }
 
+#[derive(Clone)]
 struct Symbol {
     name: String,
     offset_in_data: u64,
@@ -86,7 +87,14 @@ struct Codegen {
     par_calls: Vec<(usize, String)>,
     record_types: HashMap<String, RecordInfo>,
     subs: Vec<(String, Vec<(String, TypeExpr)>)>,
-    eighty_eights: HashMap<String, (String, i64)>,
+    eighty_eights: HashMap<String, (String, EightyEightValue)>,
+    file_keys: HashMap<String, String>,
+}
+
+#[derive(Clone)]
+enum EightyEightValue {
+    Int(i64),
+    Str(String),
 }
 
 impl Codegen {
@@ -103,6 +111,7 @@ impl Codegen {
             record_types: HashMap::new(),
             subs: Vec::new(),
             eighty_eights: HashMap::new(),
+            file_keys: HashMap::new(),
         }
     }
 
@@ -120,15 +129,16 @@ impl Codegen {
                 ..
             } => {
                 for (n88, v) in eighty_eights {
-                    let int_val = match v {
-                        Expr::IntLit(n) => *n,
+                    let value = match v {
+                        Expr::IntLit(n) => EightyEightValue::Int(*n),
+                        Expr::StringLit(s) => EightyEightValue::Str(s.clone()),
                         _ => panic!(
-                            "codegen: 88-level `{}`: value must be integer literal",
+                            "codegen: 88-level `{}`: value must be int or string literal",
                             n88
                         ),
                     };
                     self.eighty_eights
-                        .insert(n88.clone(), (name.clone(), int_val));
+                        .insert(n88.clone(), (name.clone(), value));
                 }
             }
             Stmt::Par { body, .. } | Stmt::Sub { body, .. } => {
@@ -211,33 +221,76 @@ impl Codegen {
     }
 
     fn register_typedefs(&mut self, program: &Program) {
+        // Pass 1: typedefs without redefines (so other typedefs they reference are defined first).
+        // We do all typedefs in source order; redefines only references other fields in same type
+        // (and possibly other typedefs, which must precede textually).
         for stmt in &program.statements {
-            if let Stmt::TypeDef { name, fields } = stmt {
-                let mut offset = 0u64;
-                let mut field_list = Vec::new();
+            if let Stmt::TypeDef {
+                name,
+                fields,
+                redefines,
+            } = stmt
+            {
+                let mut cursor = 0u64;
+                let mut field_list: Vec<RecordField> = Vec::new();
                 for (fname, ty) in fields {
-                    let field_size = type_size(ty);
+                    let field_size = self.type_size_dyn(ty);
+                    let off = if let Some((_, other)) =
+                        redefines.iter().find(|(f, _)| f == fname)
+                    {
+                        let other_off = field_list
+                            .iter()
+                            .find(|f| f.name == *other)
+                            .map(|f| f.offset)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "codegen: redefines target `{}` not found in record `{}`",
+                                    other, name
+                                )
+                            });
+                        other_off
+                    } else {
+                        let off = cursor;
+                        cursor += field_size;
+                        off
+                    };
                     field_list.push(RecordField {
                         name: fname.clone(),
-                        offset,
+                        offset: off,
                         ty: ty.clone(),
                     });
-                    offset += field_size;
                 }
                 self.record_types.insert(
                     name.clone(),
                     RecordInfo {
                         fields: field_list,
-                        size: offset,
+                        size: cursor,
                     },
                 );
             }
         }
     }
 
+    fn type_size_dyn(&self, ty: &TypeExpr) -> u64 {
+        match ty {
+            TypeExpr::Record(rname) => self
+                .record_types
+                .get(rname)
+                .map(|r| r.size)
+                .unwrap_or_else(|| panic!("codegen: unknown record `{}`", rname)),
+            other => type_size(other),
+        }
+    }
+
     fn collect_files(&mut self, program: &Program) {
         for stmt in &program.statements {
-            if let Stmt::FileDecl { name, path, .. } = stmt {
+            if let Stmt::FileDecl {
+                name,
+                path,
+                mode,
+                key,
+            } = stmt
+            {
                 let offset = self.data.len() as u64;
                 // 8 bytes fd, 8 bytes eof_flag, then null-terminated path
                 self.data.extend_from_slice(&[0u8; 16]);
@@ -248,6 +301,12 @@ impl Codegen {
                     offset_in_data: offset,
                     ty: TypeExpr::File,
                 });
+                if mode == "indexed" {
+                    let k = key.clone().unwrap_or_else(|| {
+                        panic!("codegen: indexed file `{}` requires `key fieldname`", name)
+                    });
+                    self.file_keys.insert(name.clone(), k);
+                }
             }
         }
     }
@@ -333,21 +392,26 @@ impl Codegen {
             Expr::Ident(n) => n.clone(),
             _ => panic!("codegen: read() second arg must be a record ident"),
         };
-        let fd_off = self.file_fd_offset(&file_name);
-        let eof_off = self.file_eof_offset(&file_name);
-        let rec_sym = self.lookup_symbol(&rec_name);
-        let rec_offset = rec_sym.offset_in_data;
-        let rec_size = self.record_size_of(&rec_name);
+        if let Some(key_field) = self.file_keys.get(&file_name).cloned() {
+            self.emit_indexed_read(&file_name, &rec_name, &key_field);
+        } else {
+            self.emit_sequential_read(&file_name, &rec_name);
+        }
+    }
 
-        // syscall: read(fd, buf, count)
+    fn emit_sequential_read(&mut self, file_name: &str, rec_name: &str) {
+        let fd_off = self.file_fd_offset(file_name);
+        let eof_off = self.file_eof_offset(file_name);
+        let rec_offset = self.lookup_symbol(rec_name).offset_in_data;
+        let rec_size = self.record_size_of(rec_name);
+
         self.emit_mov_imm64_reloc(RBX, fd_off);
         self.emit_mov_rdi_from_rbx();
-        self.emit_mov_imm64(RAX, 0); // sys_read
+        self.emit_mov_imm64(RAX, 0);
         self.emit_mov_imm64_reloc(RSI, rec_offset);
         self.emit_mov_imm64(RDX, rec_size);
         self.emit_syscall();
 
-        // if rax == 0, set EOF flag
         self.emit_test_rax_rax();
         let skip_eof = self.emit_jne_placeholder();
         self.emit_mov_imm64_reloc(RBX, eof_off);
@@ -355,6 +419,78 @@ impl Codegen {
         self.emit_mov_at_rbx_rax();
         let after = self.code.len();
         self.patch_rel32(skip_eof, after);
+    }
+
+    fn emit_indexed_read(&mut self, file_name: &str, rec_name: &str, key_field: &str) {
+        let fd_off = self.file_fd_offset(file_name);
+        let eof_off = self.file_eof_offset(file_name);
+        let rec_sym = self.lookup_symbol(rec_name).clone();
+        let rec_offset = rec_sym.offset_in_data;
+        let rec_size = self.record_size_of(rec_name);
+        let rname = match &rec_sym.ty {
+            TypeExpr::Record(n) => n.clone(),
+            _ => panic!("codegen: indexed read rec must be Record-typed"),
+        };
+        let info = self.record_types.get(&rname).unwrap();
+        let key_f = info
+            .fields
+            .iter()
+            .find(|f| f.name == key_field)
+            .unwrap_or_else(|| {
+                panic!(
+                    "codegen: indexed key field `{}` not in record `{}`",
+                    key_field, rname
+                )
+            });
+        let key_off_in_rec = key_f.offset;
+        let key_width = match &key_f.ty {
+            TypeExpr::Str(w) => *w,
+            _ => panic!("codegen: indexed key field must be str(N)"),
+        };
+        let key_off = rec_offset + key_off_in_rec;
+        let scratch_off: u64 = 0; // use SCRATCH start
+
+        // Stash rec key into scratch
+        self.emit_mov_imm64_reloc(RSI, key_off);
+        self.emit_mov_imm64_reloc(RDI, scratch_off);
+        self.emit_mov_imm64(RCX, key_width as u64);
+        self.code.push(0xFC); // cld
+        self.code.extend_from_slice(&[0xF3, 0xA4]); // rep movsb
+
+        // Loop start
+        let loop_start = self.code.len();
+
+        // Read rec_size bytes from fd into rec buffer
+        self.emit_mov_imm64_reloc(RBX, fd_off);
+        self.emit_mov_rdi_from_rbx();
+        self.emit_mov_imm64(RAX, 0);
+        self.emit_mov_imm64_reloc(RSI, rec_offset);
+        self.emit_mov_imm64(RDX, rec_size);
+        self.emit_syscall();
+
+        // If rax == 0, EOF — set eof flag and jump to end
+        self.emit_test_rax_rax();
+        let skip_eof_set = self.emit_jne_placeholder();
+        self.emit_mov_imm64_reloc(RBX, eof_off);
+        self.emit_mov_imm64(RAX, 1);
+        self.emit_mov_at_rbx_rax();
+        let exit_jump = self.emit_jmp_placeholder();
+        let after_eof_check = self.code.len();
+        self.patch_rel32(skip_eof_set, after_eof_check);
+
+        // Compare rec's key field to scratch
+        self.emit_mov_imm64_reloc(RSI, key_off);
+        self.emit_mov_imm64_reloc(RDI, scratch_off);
+        self.emit_mov_imm64(RCX, key_width as u64);
+        self.code.push(0xFC); // cld
+        self.code.extend_from_slice(&[0xF3, 0xA6]); // repe cmpsb
+
+        // jnz back to loop_start (if not equal, keep searching)
+        self.emit_jnz_rel32_back_to(loop_start);
+
+        // Found - end
+        let end = self.code.len();
+        self.patch_rel32(exit_jump, end);
     }
 
     fn emit_at_end(&mut self, args: &[Expr]) {
@@ -465,6 +601,23 @@ impl Codegen {
         }
     }
 
+    fn lvalue_type(&self, lv: &LValue) -> TypeExpr {
+        match lv {
+            LValue::Ident(name) => self.lookup_symbol(name).ty.clone(),
+            LValue::Field { base, field } => {
+                let (_, base_record) = self.lvalue_record_info(base);
+                let info = self.record_types.get(&base_record).unwrap();
+                info.fields
+                    .iter()
+                    .find(|f| f.name == *field)
+                    .map(|f| f.ty.clone())
+                    .unwrap_or_else(|| {
+                        panic!("codegen: no field `{}` in record `{}`", field, base_record)
+                    })
+            }
+        }
+    }
+
     fn lvalue_data_offset(&self, lv: &LValue) -> u64 {
         match lv {
             LValue::Ident(name) => self.lookup_symbol(name).offset_in_data,
@@ -554,6 +707,14 @@ impl Codegen {
     }
 
     fn emit_match(&mut self, expr: &Expr, arms: &[MatchArm]) {
+        if let Expr::Ident(name) = expr {
+            let sym = self.lookup_symbol(name);
+            if let TypeExpr::Str(width) = sym.ty.clone() {
+                let subject_off = sym.offset_in_data;
+                self.emit_str_match(subject_off, width, arms);
+                return;
+            }
+        }
         self.emit_expr(expr);
         self.emit_push_rax();
         let mut end_jumps = Vec::new();
@@ -581,6 +742,9 @@ impl Codegen {
                     vec![jl, jg]
                 }
                 Pattern::Wildcard => unreachable!(),
+                Pattern::StrLit(_) => {
+                    panic!("codegen: string pattern only allowed when match subject is str-typed")
+                }
             };
             for s in &arm.body {
                 self.emit_stmt(s);
@@ -606,6 +770,128 @@ impl Codegen {
     fn emit_mov_rax_rbx(&mut self) {
         // mov rax, rbx
         self.code.extend_from_slice(&[0x48, 0x89, 0xD8]);
+    }
+
+    fn emit_str_match(&mut self, subject_off: u64, width: u32, arms: &[MatchArm]) {
+        let mut end_jumps = Vec::new();
+        let mut wildcard_idx: Option<usize> = None;
+        for (idx, arm) in arms.iter().enumerate() {
+            match &arm.pattern {
+                Pattern::StrLit(s) => {
+                    if s.len() > width as usize {
+                        panic!(
+                            "codegen: str match literal of {} bytes exceeds str({})",
+                            s.len(),
+                            width
+                        );
+                    }
+                    let mut bytes = s.as_bytes().to_vec();
+                    bytes.resize(width as usize, b' ');
+                    let lit_off = self.data.len() as u64;
+                    self.data.extend(bytes);
+                    self.emit_str_byte_compare(subject_off, lit_off, width);
+                    let skip = self.emit_jne_placeholder();
+                    for s in &arm.body {
+                        self.emit_stmt(s);
+                    }
+                    end_jumps.push(self.emit_jmp_placeholder());
+                    let next = self.code.len();
+                    self.patch_rel32(skip, next);
+                }
+                Pattern::Wildcard => {
+                    wildcard_idx = Some(idx);
+                }
+                _ => panic!(
+                    "codegen: str-typed match subject requires string literal patterns or `_`"
+                ),
+            }
+        }
+        if let Some(idx) = wildcard_idx {
+            for s in &arms[idx].body {
+                self.emit_stmt(s);
+            }
+        }
+        let end = self.code.len();
+        for j in end_jumps {
+            self.patch_rel32(j, end);
+        }
+    }
+
+    fn resolve_expr_address(&self, e: &Expr) -> (u64, TypeExpr) {
+        match e {
+            Expr::Ident(name) => {
+                let sym = self.lookup_symbol(name);
+                (sym.offset_in_data, sym.ty.clone())
+            }
+            Expr::FieldAccess { base, field } => {
+                let (base_off, base_ty) = self.resolve_expr_address(base);
+                let rname = match base_ty {
+                    TypeExpr::Record(n) => n,
+                    other => panic!(
+                        "codegen: cannot access field `{}` on non-record type {:?}",
+                        field, other
+                    ),
+                };
+                let info = self.record_types.get(&rname).unwrap_or_else(|| {
+                    panic!("codegen: unknown record `{}`", rname)
+                });
+                let f = info
+                    .fields
+                    .iter()
+                    .find(|f| f.name == *field)
+                    .unwrap_or_else(|| {
+                        panic!("codegen: no field `{}` in record `{}`", field, rname)
+                    });
+                (base_off + f.offset, f.ty.clone())
+            }
+            _ => panic!("codegen: cannot resolve expression to address: {:?}", e),
+        }
+    }
+
+    fn str_operand_width(&self, e: &Expr) -> Option<u32> {
+        match e {
+            Expr::Ident(_) | Expr::FieldAccess { .. } => {
+                let (_, ty) = self.resolve_expr_address(e);
+                if let TypeExpr::Str(w) = ty {
+                    Some(w)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn resolve_str_operand(&mut self, e: &Expr, width: u32) -> u64 {
+        match e {
+            Expr::Ident(_) | Expr::FieldAccess { .. } => self.resolve_expr_address(e).0,
+            Expr::StringLit(s) => {
+                if s.len() > width as usize {
+                    panic!(
+                        "codegen: string literal of {} bytes exceeds str({}) in compare",
+                        s.len(),
+                        width
+                    );
+                }
+                let mut bytes = s.as_bytes().to_vec();
+                bytes.resize(width as usize, b' ');
+                let off = self.data.len() as u64;
+                self.data.extend(bytes);
+                off
+            }
+            _ => panic!("codegen: str compare operand must be ident or string literal"),
+        }
+    }
+
+    fn emit_str_byte_compare(&mut self, left_off: u64, right_off: u64, width: u32) {
+        self.emit_mov_imm64_reloc(RSI, left_off);
+        self.emit_mov_imm64_reloc(RDI, right_off);
+        self.emit_mov_imm64(RCX, width as u64);
+        // cld
+        self.code.push(0xFC);
+        // repe cmpsb (F3 A6)
+        self.code.extend_from_slice(&[0xF3, 0xA6]);
+        // ZF=1 iff equal
     }
 
     fn emit_if(&mut self, cond: &Expr, then_body: &[Stmt], else_body: &[Stmt]) {
@@ -697,10 +983,26 @@ impl Codegen {
     }
 
     fn emit_assign(&mut self, target: &LValue, value: &Expr) {
-        self.emit_expr(value);
-        let offset = self.lvalue_data_offset(target);
-        self.emit_mov_imm64_reloc(RBX, offset);
-        self.emit_mov_at_rbx_rax();
+        let target_ty = self.lvalue_type(target);
+        let target_offset = self.lvalue_data_offset(target);
+        if let TypeExpr::Str(width) = target_ty {
+            let source_offset = self.resolve_str_operand(value, width);
+            self.emit_str_copy(source_offset, target_offset, width);
+        } else {
+            self.emit_expr(value);
+            self.emit_mov_imm64_reloc(RBX, target_offset);
+            self.emit_mov_at_rbx_rax();
+        }
+    }
+
+    fn emit_str_copy(&mut self, src_off: u64, dst_off: u64, width: u32) {
+        self.emit_mov_imm64_reloc(RSI, src_off);
+        self.emit_mov_imm64_reloc(RDI, dst_off);
+        self.emit_mov_imm64(RCX, width as u64);
+        // cld
+        self.code.push(0xFC);
+        // rep movsb (F3 A4)
+        self.code.extend_from_slice(&[0xF3, 0xA4]);
     }
 
     fn emit_print(&mut self, arg: &Expr) {
@@ -734,20 +1036,13 @@ impl Codegen {
                     _ => None,
                 }
             }
-            Expr::FieldAccess { base, field } => {
-                let base_name = match base.as_ref() {
-                    Expr::Ident(n) => n,
-                    _ => return None,
-                };
-                let sym = self.lookup_symbol(base_name);
-                if let TypeExpr::Record(rname) = &sym.ty {
-                    let info = self.record_types.get(rname)?;
-                    let f = info.fields.iter().find(|f| f.name == *field)?;
-                    if let TypeExpr::UDec(_, m) | TypeExpr::IDec(_, m) = &f.ty {
-                        return Some(*m);
-                    }
+            Expr::FieldAccess { .. } => {
+                let (_, ty) = self.resolve_expr_address(arg);
+                if let TypeExpr::UDec(_, m) | TypeExpr::IDec(_, m) = ty {
+                    Some(m)
+                } else {
+                    None
                 }
-                None
             }
             _ => None,
         }
@@ -755,27 +1050,13 @@ impl Codegen {
 
     fn try_resolve_str_ident(&self, arg: &Expr) -> Option<(u64, u64)> {
         match arg {
-            Expr::Ident(name) => {
-                let sym = self.lookup_symbol(name);
-                if let TypeExpr::Str(n) = &sym.ty {
-                    return Some((sym.offset_in_data, *n as u64));
+            Expr::Ident(_) | Expr::FieldAccess { .. } => {
+                let (off, ty) = self.resolve_expr_address(arg);
+                if let TypeExpr::Str(n) = ty {
+                    Some((off, n as u64))
+                } else {
+                    None
                 }
-                None
-            }
-            Expr::FieldAccess { base, field } => {
-                let base_name = match base.as_ref() {
-                    Expr::Ident(n) => n,
-                    _ => return None,
-                };
-                let sym = self.lookup_symbol(base_name);
-                if let TypeExpr::Record(rname) = &sym.ty {
-                    let info = self.record_types.get(rname)?;
-                    let f = info.fields.iter().find(|f| f.name == *field)?;
-                    if let TypeExpr::Str(n) = &f.ty {
-                        return Some((sym.offset_in_data + f.offset, *n as u64));
-                    }
-                }
-                None
             }
             _ => None,
         }
@@ -859,13 +1140,42 @@ impl Codegen {
             }
             Expr::Ident(name) => {
                 if let Some((parent, value)) = self.eighty_eights.get(name).cloned() {
-                    let parent_offset = self.lookup_symbol(&parent).offset_in_data;
-                    self.emit_mov_imm64_reloc(RBX, parent_offset);
-                    self.emit_mov_rax_from_rbx();
-                    self.emit_mov_imm64(RBX, value as u64);
-                    self.emit_cmp_rax_rbx();
-                    self.emit_setcc_dl(CmpOp::Eq);
-                    self.emit_movzx_eax_dl();
+                    let parent_sym = self.lookup_symbol(&parent).clone();
+                    match (value, &parent_sym.ty) {
+                        (EightyEightValue::Int(v), _) => {
+                            self.emit_mov_imm64_reloc(RBX, parent_sym.offset_in_data);
+                            self.emit_mov_rax_from_rbx();
+                            self.emit_mov_imm64(RBX, v as u64);
+                            self.emit_cmp_rax_rbx();
+                            self.emit_setcc_dl(CmpOp::Eq);
+                            self.emit_movzx_eax_dl();
+                        }
+                        (EightyEightValue::Str(s), TypeExpr::Str(width)) => {
+                            let mut bytes = s.as_bytes().to_vec();
+                            if bytes.len() > *width as usize {
+                                panic!(
+                                    "codegen: 88-level `{}` literal exceeds str({})",
+                                    name, width
+                                );
+                            }
+                            bytes.resize(*width as usize, b' ');
+                            let lit_off = self.data.len() as u64;
+                            self.data.extend(bytes);
+                            self.emit_str_byte_compare(
+                                parent_sym.offset_in_data,
+                                lit_off,
+                                *width,
+                            );
+                            self.emit_setcc_dl(CmpOp::Eq);
+                            self.emit_movzx_eax_dl();
+                        }
+                        (EightyEightValue::Str(_), other) => {
+                            panic!(
+                                "codegen: 88-level `{}` has string value but parent type is {:?}",
+                                name, other
+                            );
+                        }
+                    }
                 } else {
                     let offset = self.lookup_symbol(name).offset_in_data;
                     self.emit_mov_imm64_reloc(RBX, offset);
@@ -894,14 +1204,38 @@ impl Codegen {
                 }
             }
             Expr::Compare { op, left, right } => {
-                self.emit_expr(left);
-                self.emit_push_rax();
-                self.emit_expr(right);
-                self.emit_mov_rbx_rax();
-                self.emit_pop_rax();
-                self.emit_cmp_rax_rbx();
-                self.emit_setcc_dl(*op);
-                self.emit_movzx_eax_dl();
+                let l_w = self.str_operand_width(left);
+                let r_w = self.str_operand_width(right);
+                if l_w.is_some() || r_w.is_some() {
+                    if !matches!(op, CmpOp::Eq | CmpOp::Ne) {
+                        panic!("codegen: string compare supports only == and !=");
+                    }
+                    let width = l_w.or(r_w).unwrap();
+                    if let Some(lw) = l_w {
+                        if lw != width {
+                            panic!("codegen: str compare width mismatch ({} vs {})", lw, width);
+                        }
+                    }
+                    if let Some(rw) = r_w {
+                        if rw != width {
+                            panic!("codegen: str compare width mismatch ({} vs {})", rw, width);
+                        }
+                    }
+                    let left_off = self.resolve_str_operand(left, width);
+                    let right_off = self.resolve_str_operand(right, width);
+                    self.emit_str_byte_compare(left_off, right_off, width);
+                    self.emit_setcc_dl(*op);
+                    self.emit_movzx_eax_dl();
+                } else {
+                    self.emit_expr(left);
+                    self.emit_push_rax();
+                    self.emit_expr(right);
+                    self.emit_mov_rbx_rax();
+                    self.emit_pop_rax();
+                    self.emit_cmp_rax_rbx();
+                    self.emit_setcc_dl(*op);
+                    self.emit_movzx_eax_dl();
+                }
             }
             Expr::Not { inner } => {
                 self.emit_expr(inner);
@@ -932,27 +1266,9 @@ impl Codegen {
                     panic!("codegen: `{}` not callable in expression context", name);
                 }
             }
-            Expr::FieldAccess { base, field } => {
-                let base_name = match base.as_ref() {
-                    Expr::Ident(name) => name,
-                    _ => panic!("codegen: only single-level field access supported"),
-                };
-                let sym = self.lookup_symbol(base_name);
-                let base_offset = sym.offset_in_data;
-                let record_name = match &sym.ty {
-                    TypeExpr::Record(rname) => rname.clone(),
-                    _ => panic!("codegen: `{}` is not a record", base_name),
-                };
-                let info = self.record_types.get(&record_name).unwrap();
-                let f = info
-                    .fields
-                    .iter()
-                    .find(|f| f.name == *field)
-                    .unwrap_or_else(|| {
-                        panic!("codegen: no field `{}` in record `{}`", field, record_name)
-                    });
-                let total_offset = base_offset + f.offset;
-                self.emit_mov_imm64_reloc(RBX, total_offset);
+            Expr::FieldAccess { .. } => {
+                let (offset, _ty) = self.resolve_expr_address(expr);
+                self.emit_mov_imm64_reloc(RBX, offset);
                 self.emit_mov_rax_from_rbx();
             }
             Expr::StringLit(_) => {

@@ -9,7 +9,7 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
     };
 
     for stmt in &program.statements {
-        if let Stmt::TypeDef { name, fields } = stmt {
+        if let Stmt::TypeDef { name, fields, redefines: _ } = stmt {
             if c.records.contains_key(name) {
                 c.errors.push(format!("type `{}` defined more than once", name));
             } else {
@@ -17,9 +17,9 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
             }
         }
         if let Stmt::FileDecl { name, mode, .. } = stmt {
-            if mode != "sequential" {
+            if mode != "sequential" && mode != "indexed" {
                 c.errors.push(format!(
-                    "file `{}`: only `sequential` mode is supported in v0.3 (got `{}`)",
+                    "file `{}`: only `sequential` or `indexed` modes supported (got `{}`)",
                     name, mode
                 ));
             }
@@ -95,11 +95,6 @@ impl Checker {
             Stmt::Assign { target, value } => {
                 let target_ty = self.resolve_lvalue_type(target);
                 if let Some(t) = &target_ty {
-                    if matches!(t, TypeExpr::Str(_)) {
-                        self.errors.push(format!(
-                            "runtime assignment to str(N) is not yet supported (only let-init)"
-                        ));
-                    }
                     if let TypeExpr::UDec(_, m) | TypeExpr::IDec(_, m) = t {
                         if let Expr::DecLit { scale, .. } = value {
                             if *scale != *m {

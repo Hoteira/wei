@@ -1,0 +1,18 @@
+type DateParts:
+    year str(4)
+    month str(2)
+    day str(2)
+
+type DateField:
+    date_as_str str(8)
+    date_parts redefines date_as_str DateParts
+
+let df DateField
+
+par main:
+    df.date_as_str = "20260523"
+    print(df.date_parts.year)
+    print(df.date_parts.month)
+    print(df.date_parts.day)
+
+main()

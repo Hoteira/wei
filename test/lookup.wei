@@ -1,0 +1,18 @@
+type Employee:
+    emp_name str(20)
+    emp_salary udec(7,2)
+
+file emp_file = "/tmp/employees3.dat" indexed key emp_name
+let emp Employee
+
+par main:
+    open(emp_file, input)
+    emp.emp_name = "Bob"
+    read(emp_file, emp)
+    if at_end(emp_file):
+        print(0)
+    else:
+        print(emp.emp_salary)
+    close(emp_file)
+
+main()

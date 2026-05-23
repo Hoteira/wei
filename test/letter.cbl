@@ -1,0 +1,30 @@
+IDENTIFICATION DIVISION.
+PROGRAM-ID. LETTER.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01 CODE PIC X VALUE "B".
+    88 IS-A VALUE "A".
+    88 IS-B VALUE "B".
+PROCEDURE DIVISION.
+MAIN-PROC.
+    IF IS-B THEN
+        DISPLAY 1
+    END-IF.
+    EVALUATE CODE
+        WHEN "A"
+            DISPLAY 9
+        WHEN "B"
+            DISPLAY 2
+        WHEN OTHER
+            DISPLAY 9
+    END-EVALUATE.
+    MOVE "Z" TO CODE.
+    EVALUATE CODE
+        WHEN "A"
+            DISPLAY 9
+        WHEN "B"
+            DISPLAY 9
+        WHEN OTHER
+            DISPLAY 3
+    END-EVALUATE.
+    STOP RUN.

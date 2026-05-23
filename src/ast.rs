@@ -45,11 +45,13 @@ pub enum Stmt {
     TypeDef {
         name: String,
         fields: Vec<(String, TypeExpr)>,
+        redefines: Vec<(String, String)>,
     },
     FileDecl {
         name: String,
         path: String,
         mode: String,
+        key: Option<String>,
     },
     Sub {
         name: String,
@@ -68,6 +70,7 @@ pub struct MatchArm {
 pub enum Pattern {
     Lit(i64),
     Range(i64, i64),
+    StrLit(String),
     Wildcard,
 }
 

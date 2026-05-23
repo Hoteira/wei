@@ -1,0 +1,21 @@
+let status str(1) = "A"
+    is is_active = "A"
+    is is_inactive = "I"
+    is is_pending = "P"
+
+par main:
+    if is_active:
+        print(1)
+    if is_inactive:
+        print(9)
+    else:
+        print(2)
+    status = "P"
+    if is_pending:
+        print(3)
+    if is_active:
+        print(9)
+    else:
+        print(4)
+
+main()

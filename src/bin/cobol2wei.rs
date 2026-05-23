@@ -146,13 +146,27 @@ struct FileDecl {
     name: String,
     path: String,
     org: String,
+    key: Option<String>,
 }
 
 #[derive(Debug)]
 struct RecordType {
     type_name: String,
     var_name: String,
-    fields: Vec<(String, PicType)>,
+    fields: Vec<RecField>,
+}
+
+#[derive(Debug)]
+struct RecField {
+    name: String,
+    kind: FieldKind,
+    redefines: Option<String>,
+}
+
+#[derive(Debug)]
+enum FieldKind {
+    Pic(PicType),
+    Sub(String),
 }
 
 #[derive(Debug)]
@@ -241,6 +255,7 @@ enum Stmt {
 enum EvalPattern {
     Lit(i64),
     Thru(i64, i64),
+    StrLit(String),
     Other,
 }
 
@@ -543,6 +558,7 @@ impl<'a> Parser<'a> {
                         ),
                     };
                     let mut org = "sequential".to_string();
+                    let mut key: Option<String> = None;
                     while !matches!(self.peek(), Token::Period) {
                         match self.peek().clone() {
                             Token::Word(w) if w == "ORGANIZATION" => {
@@ -552,6 +568,25 @@ impl<'a> Parser<'a> {
                                 }
                                 let v = self.expect_word_any();
                                 org = v.to_lowercase();
+                            }
+                            Token::Word(w) if w == "ACCESS" => {
+                                self.advance();
+                                if matches!(self.peek(), Token::Word(w) if w == "MODE") {
+                                    self.advance();
+                                }
+                                if matches!(self.peek(), Token::Word(w) if w == "IS") {
+                                    self.advance();
+                                }
+                                let _ = self.expect_word_any();
+                            }
+                            Token::Word(w) if w == "RECORD" => {
+                                self.advance();
+                                self.expect_word("KEY");
+                                if matches!(self.peek(), Token::Word(w) if w == "IS") {
+                                    self.advance();
+                                }
+                                let k = self.expect_word_any();
+                                key = Some(to_wei_ident(&k));
                             }
                             Token::Eof => break,
                             _ => {
@@ -564,6 +599,7 @@ impl<'a> Parser<'a> {
                         name: to_wei_ident(&fname),
                         path,
                         org,
+                        key,
                     });
                 }
                 Token::Word(w) if w == "DATA" || w == "PROCEDURE" => return,
@@ -616,21 +652,7 @@ impl<'a> Parser<'a> {
                     self.expect_period();
                     let record_var = to_wei_ident(&rec_cobol);
                     let type_name = to_pascal_case(&rec_cobol);
-                    let mut fields = Vec::new();
-                    while let Token::IntLit(n) = self.peek().clone() {
-                        if n == 1 || n == 88 {
-                            break;
-                        }
-                        if !(2..=49).contains(&n) {
-                            break;
-                        }
-                        self.advance();
-                        let fname = self.expect_word_any();
-                        self.expect_word("PIC");
-                        let ty = self.parse_pic();
-                        self.expect_period();
-                        fields.push((to_wei_ident(&fname), ty));
-                    }
+                    let fields = self.parse_group_fields(program, 1, &type_name);
                     program.records.push(RecordType {
                         type_name,
                         var_name: record_var.clone(),
@@ -656,23 +678,10 @@ impl<'a> Parser<'a> {
                     let name = self.expect_word_any();
                     if matches!(self.peek(), Token::Period) {
                         self.advance();
-                        let mut fields = Vec::new();
-                        while let Token::IntLit(n) = self.peek().clone() {
-                            if n == 1 || n == 88 {
-                                break;
-                            }
-                            if !(2..=49).contains(&n) {
-                                break;
-                            }
-                            self.advance();
-                            let fname = self.expect_word_any();
-                            self.expect_word("PIC");
-                            let ty = self.parse_pic();
-                            self.expect_period();
-                            fields.push((to_wei_ident(&fname), ty));
-                        }
+                        let type_name = to_pascal_case(&name);
+                        let fields = self.parse_group_fields(program, 1, &type_name);
                         program.records.push(RecordType {
-                            type_name: to_pascal_case(&name),
+                            type_name,
                             var_name: to_wei_ident(&name),
                             fields,
                         });
@@ -711,6 +720,56 @@ impl<'a> Parser<'a> {
                 ),
             }
         }
+    }
+
+    fn parse_group_fields(
+        &mut self,
+        program: &mut Program,
+        parent_level: i64,
+        parent_type: &str,
+    ) -> Vec<RecField> {
+        let mut fields = Vec::new();
+        loop {
+            let level = match self.peek() {
+                Token::IntLit(n) if *n > parent_level && *n != 88 && *n < 50 => *n,
+                _ => break,
+            };
+            self.advance();
+            let fname_cobol = self.expect_word_any();
+            let fname = to_wei_ident(&fname_cobol);
+            let redefines = if matches!(self.peek(), Token::Word(w) if w == "REDEFINES") {
+                self.advance();
+                let target = self.expect_word_any();
+                Some(to_wei_ident(&target))
+            } else {
+                None
+            };
+            if matches!(self.peek(), Token::Word(w) if w == "PIC") {
+                self.advance();
+                let ty = self.parse_pic();
+                self.expect_period();
+                fields.push(RecField {
+                    name: fname,
+                    kind: FieldKind::Pic(ty),
+                    redefines,
+                });
+            } else {
+                self.expect_period();
+                let sub_type = format!("{}{}", parent_type, to_pascal_case(&fname_cobol));
+                let sub_fields = self.parse_group_fields(program, level, &sub_type);
+                program.records.push(RecordType {
+                    type_name: sub_type.clone(),
+                    var_name: format!("__inner_{}", fname),
+                    fields: sub_fields,
+                });
+                fields.push(RecField {
+                    name: fname,
+                    kind: FieldKind::Sub(sub_type),
+                    redefines,
+                });
+            }
+        }
+        fields
     }
 
     fn parse_pic(&mut self) -> PicType {
@@ -1019,6 +1078,12 @@ impl<'a> Parser<'a> {
                             {
                                 self.advance();
                                 EvalPattern::Other
+                            } else if let Token::StringLit(_) = self.peek() {
+                                if let Token::StringLit(s) = self.advance() {
+                                    EvalPattern::StrLit(s)
+                                } else {
+                                    unreachable!()
+                                }
                             } else {
                                 let lo = self.expect_intlit();
                                 if matches!(self.peek(), Token::Word(w) if w == "THRU" || w == "THROUGH")
@@ -1375,8 +1440,11 @@ fn resolve(program: &Program) -> Resolved {
         r.fd_record.insert(fd.file_name.clone(), fd.record_var.clone());
     }
     for rec in &program.records {
-        for (fname, _) in &rec.fields {
-            r.field_owner.insert(fname.clone(), rec.var_name.clone());
+        if rec.var_name.starts_with("__inner_") {
+            continue;
+        }
+        for f in &rec.fields {
+            r.field_owner.insert(f.name.clone(), rec.var_name.clone());
         }
     }
     for s in &program.ws_scalars {
@@ -1542,13 +1610,26 @@ fn emit(program: &Program) -> String {
     let mut out = String::new();
 
     for rec in &program.records {
-        out.push_str(&format!(
-            "// COBOL: 01 {}.\n",
-            to_cobol_name(&rec.var_name)
-        ));
+        if rec.var_name.starts_with("__inner_") {
+            out.push_str(&format!("// (synthetic sub-record)\n"));
+        } else {
+            out.push_str(&format!(
+                "// COBOL: 01 {}.\n",
+                to_cobol_name(&rec.var_name)
+            ));
+        }
         out.push_str(&format!("type {}:\n", rec.type_name));
-        for (fname, ty) in &rec.fields {
-            out.push_str(&format!("    {} {}\n", fname, pic_to_str(ty)));
+        for f in &rec.fields {
+            let ty_str = match &f.kind {
+                FieldKind::Pic(p) => pic_to_str(p),
+                FieldKind::Sub(name) => name.clone(),
+            };
+            let redef = if let Some(target) = &f.redefines {
+                format!(" redefines {}", target)
+            } else {
+                String::new()
+            };
+            out.push_str(&format!("    {}{} {}\n", f.name, redef, ty_str));
         }
         out.push('\n');
     }
@@ -1576,19 +1657,36 @@ fn emit(program: &Program) -> String {
     }
 
     for f in &program.files {
+        let key_suffix = if let Some(k) = &f.key {
+            format!(" RECORD KEY IS {}", to_cobol_name(k))
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
-            "// COBOL: SELECT {} ASSIGN TO \"{}\" ORGANIZATION IS {}.\n",
+            "// COBOL: SELECT {} ASSIGN TO \"{}\" ORGANIZATION IS {}{}.\n",
             to_cobol_name(&f.name),
             f.path,
-            f.org.to_uppercase()
+            f.org.to_uppercase(),
+            key_suffix
         ));
-        out.push_str(&format!("file {} = \"{}\" {}\n", f.name, f.path, f.org));
+        let wei_key_suffix = if let Some(k) = &f.key {
+            format!(" key {}", k)
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "file {} = \"{}\" {}{}\n",
+            f.name, f.path, f.org, wei_key_suffix
+        ));
     }
     if !program.files.is_empty() {
         out.push('\n');
     }
 
     for rec in &program.records {
+        if rec.var_name.starts_with("__inner_") {
+            continue;
+        }
         out.push_str(&format!("let {} {}\n", rec.var_name, rec.type_name));
     }
 
@@ -1612,9 +1710,7 @@ fn emit(program: &Program) -> String {
         for (n88, v) in &s.eighty_eights {
             let v_str = match v {
                 Literal::Int(n) => n.to_string(),
-                Literal::Str(_) => {
-                    panic!("cobol2wei: 88-level on non-EOF flag with string value not supported")
-                }
+                Literal::Str(sv) => format!("\"{}\"", sv),
             };
             out.push_str(&format!(
                 "    // COBOL: 88 {} VALUE {}.\n",
@@ -1836,6 +1932,10 @@ fn emit_stmt(out: &mut String, s: &Stmt, indent: usize, r: &Resolved) {
                     EvalPattern::Thru(lo, hi) => {
                         out.push_str(&format!("{}// COBOL: WHEN {} THRU {}\n", arm_pad, lo, hi));
                         out.push_str(&format!("{}{}..={} =>\n", arm_pad, lo, hi));
+                    }
+                    EvalPattern::StrLit(s) => {
+                        out.push_str(&format!("{}// COBOL: WHEN \"{}\"\n", arm_pad, s));
+                        out.push_str(&format!("{}\"{}\" =>\n", arm_pad, s));
                     }
                     EvalPattern::Other => {
                         out.push_str(&format!("{}// COBOL: WHEN OTHER\n", arm_pad));

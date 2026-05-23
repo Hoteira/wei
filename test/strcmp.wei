@@ -1,0 +1,17 @@
+let a str(5) = "Alice"
+let b str(5) = "Bob  "
+let c str(5) = "Alice"
+
+par main:
+    if a == c:
+        print(1)
+    if a == b:
+        print(9)
+    else:
+        print(2)
+    if a == "Alice":
+        print(3)
+    if b != "Alice":
+        print(4)
+
+main()

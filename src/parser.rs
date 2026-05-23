@@ -92,7 +92,18 @@ impl<'a> Parser<'a> {
         self.expect_eq();
         let path = self.expect_string_lit();
         let mode = self.expect_ident();
-        Stmt::FileDecl { name, path, mode }
+        let key = if matches!(self.peek(), Token::Ident(n) if n == "key") {
+            self.pos += 1;
+            Some(self.expect_ident())
+        } else {
+            None
+        };
+        Stmt::FileDecl {
+            name,
+            path,
+            mode,
+            key,
+        }
     }
 
     fn parse_typedef(&mut self) -> Stmt {
@@ -102,14 +113,24 @@ impl<'a> Parser<'a> {
         self.skip_newlines();
         self.expect_indent();
         let mut fields = Vec::new();
+        let mut redefines = Vec::new();
         while !matches!(self.peek(), Token::Dedent | Token::Eof) {
             let fname = self.expect_ident();
+            if matches!(self.peek(), Token::Ident(n) if n == "redefines") {
+                self.pos += 1;
+                let other = self.expect_ident();
+                redefines.push((fname.clone(), other));
+            }
             let ty = self.parse_type();
             fields.push((fname, ty));
             self.skip_newlines();
         }
         self.expect_dedent();
-        Stmt::TypeDef { name, fields }
+        Stmt::TypeDef {
+            name,
+            fields,
+            redefines,
+        }
     }
 
     fn parse_lvalue(&mut self) -> LValue {
@@ -158,6 +179,10 @@ impl<'a> Parser<'a> {
                 } else {
                     Pattern::Lit(lo)
                 }
+            }
+            Token::StringLit(s) => {
+                self.pos += 1;
+                Pattern::StrLit(s)
             }
             other => panic!("parse error: expected pattern, got {:?}", other),
         }
