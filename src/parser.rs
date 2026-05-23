@@ -42,6 +42,9 @@ impl<'a> Parser<'a> {
             if name == "par" {
                 return self.parse_par();
             }
+            if name == "sub" {
+                return self.parse_sub();
+            }
             if name == "for" {
                 return self.parse_for();
             }
@@ -258,6 +261,35 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_sub(&mut self) -> Stmt {
+        self.pos += 1; // consume "sub"
+        let name = self.expect_ident();
+        self.expect_lparen();
+        let mut params = Vec::new();
+        if !matches!(self.peek(), Token::RParen) {
+            let pname = self.expect_ident();
+            let pty = self.parse_type();
+            params.push((pname, pty));
+            while matches!(self.peek(), Token::Comma) {
+                self.pos += 1;
+                let pname = self.expect_ident();
+                let pty = self.parse_type();
+                params.push((pname, pty));
+            }
+        }
+        self.expect_rparen();
+        self.expect_colon();
+        self.skip_newlines();
+        self.expect_indent();
+        let mut body = Vec::new();
+        while !matches!(self.peek(), Token::Dedent | Token::Eof) {
+            body.push(self.parse_statement());
+            self.skip_newlines();
+        }
+        self.expect_dedent();
+        Stmt::Sub { name, params, body }
+    }
+
     fn parse_par(&mut self) -> Stmt {
         self.pos += 1; // consume "par"
         let name = self.expect_ident();
@@ -290,7 +322,35 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Stmt::Let { name, ty, init }
+        let save = self.pos;
+        self.skip_newlines();
+        let mut eighty_eights = Vec::new();
+        if matches!(self.peek(), Token::Indent) {
+            self.pos += 1;
+            let mut consumed_any = false;
+            while matches!(self.peek(), Token::Ident(n) if n == "is") {
+                self.pos += 1;
+                let n = self.expect_ident();
+                self.expect_eq();
+                let v = self.parse_expr();
+                eighty_eights.push((n, v));
+                self.skip_newlines();
+                consumed_any = true;
+            }
+            if consumed_any {
+                self.expect_dedent();
+            } else {
+                self.pos = save;
+            }
+        } else {
+            self.pos = save;
+        }
+        Stmt::Let {
+            name,
+            ty,
+            init,
+            eighty_eights,
+        }
     }
 
     fn parse_type(&mut self) -> TypeExpr {

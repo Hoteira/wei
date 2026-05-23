@@ -12,6 +12,10 @@ enum Token {
     RParen,
     Period,
     Comma,
+    Plus,
+    Minus,
+    Star,
+    Slash,
     Eq,
     Lt,
     Gt,
@@ -44,6 +48,18 @@ fn lex(source: &str) -> Vec<Token> {
             i += 1;
         } else if b == b')' {
             tokens.push(Token::RParen);
+            i += 1;
+        } else if b == b'+' {
+            tokens.push(Token::Plus);
+            i += 1;
+        } else if b == b'-' {
+            tokens.push(Token::Minus);
+            i += 1;
+        } else if b == b'*' {
+            tokens.push(Token::Star);
+            i += 1;
+        } else if b == b'/' {
+            tokens.push(Token::Slash);
             i += 1;
         } else if b == b'<' {
             if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
@@ -158,6 +174,19 @@ enum Expr {
     Ident(String),
     Int(i64),
     Str(String),
+    Bin {
+        op: ArithOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -184,8 +213,16 @@ enum Stmt {
     Move { value: Expr, target: String },
     Add { value: Expr, target: String },
     Subtract { value: Expr, target: String },
+    Compute { target: String, expr: Expr },
     Perform { para: String },
     PerformUntil { cond: Cond, body: Vec<Stmt> },
+    ForRange {
+        var: String,
+        start: Expr,
+        end: Expr,
+        end_inclusive: bool,
+        body: Vec<Stmt>,
+    },
     If {
         cond: Cond,
         then_body: Vec<Stmt>,
@@ -195,6 +232,8 @@ enum Stmt {
     Read { file: String, at_end_target: Option<String> },
     Close { file: String },
     Evaluate { expr: Expr, arms: Vec<EvalArm> },
+    CallSub { name: String, args: Vec<Expr> },
+    ExitProgram,
     StopRun,
 }
 
@@ -217,6 +256,13 @@ struct Paragraph {
     body: Vec<Stmt>,
 }
 
+#[derive(Debug)]
+struct SubDef {
+    name: String,
+    params: Vec<(String, PicType)>,
+    body: Vec<Stmt>,
+}
+
 #[derive(Debug, Default)]
 struct Program {
     files: Vec<FileDecl>,
@@ -225,6 +271,7 @@ struct Program {
     ws_scalars: Vec<WSScalar>,
     main_code: Vec<Stmt>,
     paragraphs: Vec<Paragraph>,
+    subs: Vec<SubDef>,
 }
 
 fn to_wei_ident(s: &str) -> String {
@@ -277,35 +324,185 @@ impl<'a> Parser<'a> {
 
     fn parse_program(&mut self) -> Program {
         let mut program = Program::default();
+        self.parse_main_program(&mut program);
+        while matches!(self.peek(), Token::Word(w) if w == "IDENTIFICATION") {
+            let sub = self.parse_subprogram();
+            program.subs.push(sub);
+        }
+        program
+    }
 
+    fn parse_main_program(&mut self, program: &mut Program) {
+        // Skip leading IDENTIFICATION DIVISION header for the first program.
+        if matches!(self.peek(), Token::Word(w) if w == "IDENTIFICATION") {
+            loop {
+                match self.peek() {
+                    Token::Word(w)
+                        if w == "ENVIRONMENT" || w == "DATA" || w == "PROCEDURE" =>
+                    {
+                        break
+                    }
+                    Token::Eof => return,
+                    _ => {
+                        self.advance();
+                    }
+                }
+            }
+        }
         while !self.at_eof() {
+            if matches!(self.peek(), Token::Word(w) if w == "IDENTIFICATION") {
+                break;
+            }
             match self.peek() {
                 Token::Word(w) if w == "ENVIRONMENT" => {
                     self.advance();
                     self.expect_word("DIVISION");
                     self.expect_period();
-                    self.parse_environment_division(&mut program);
+                    self.parse_environment_division(program);
                 }
                 Token::Word(w) if w == "DATA" => {
                     self.advance();
                     self.expect_word("DIVISION");
                     self.expect_period();
-                    self.parse_data_division(&mut program);
+                    self.parse_data_division(program);
                 }
                 Token::Word(w) if w == "PROCEDURE" => {
                     self.advance();
                     self.expect_word("DIVISION");
                     self.expect_period();
-                    self.parse_procedure_division(&mut program);
-                    break;
+                    self.parse_procedure_division(program);
                 }
                 _ => {
                     self.advance();
                 }
             }
         }
+    }
 
-        program
+    fn parse_subprogram(&mut self) -> SubDef {
+        self.expect_word("IDENTIFICATION");
+        self.expect_word("DIVISION");
+        self.expect_period();
+        // Skip until PROGRAM-ID.
+        loop {
+            match self.peek() {
+                Token::Word(w) if w == "PROGRAM-ID" => {
+                    self.advance();
+                    self.expect_period();
+                    break;
+                }
+                Token::Eof => panic!("cobol2wei: expected PROGRAM-ID in subprogram"),
+                _ => {
+                    self.advance();
+                }
+            }
+        }
+        let name_cobol = self.expect_word_any();
+        self.expect_period();
+        let sub_name = to_wei_ident(&name_cobol);
+
+        let mut linkage: Vec<(String, PicType)> = Vec::new();
+
+        loop {
+            match self.peek().clone() {
+                Token::Word(ref w) if w == "DATA" => {
+                    self.advance();
+                    self.expect_word("DIVISION");
+                    self.expect_period();
+                    loop {
+                        match self.peek().clone() {
+                            Token::Word(ref w) if w == "LINKAGE" => {
+                                self.advance();
+                                self.expect_word("SECTION");
+                                self.expect_period();
+                                loop {
+                                    match self.peek().clone() {
+                                        Token::IntLit(1) => {
+                                            self.advance();
+                                            let pn = self.expect_word_any();
+                                            self.expect_word("PIC");
+                                            let ty = self.parse_pic();
+                                            self.expect_period();
+                                            linkage.push((to_wei_ident(&pn), ty));
+                                        }
+                                        Token::Word(ref w) if w == "PROCEDURE" => break,
+                                        Token::Eof => break,
+                                        other => panic!(
+                                            "cobol2wei: unexpected in LINKAGE: {:?}",
+                                            other
+                                        ),
+                                    }
+                                }
+                                break;
+                            }
+                            Token::Word(ref w) if w == "PROCEDURE" => break,
+                            Token::Eof => break,
+                            _ => {
+                                self.advance();
+                            }
+                        }
+                    }
+                }
+                Token::Word(ref w) if w == "PROCEDURE" => break,
+                Token::Eof => panic!("cobol2wei: subprogram missing PROCEDURE DIVISION"),
+                _ => {
+                    self.advance();
+                }
+            }
+        }
+
+        self.expect_word("PROCEDURE");
+        self.expect_word("DIVISION");
+        let mut params: Vec<(String, PicType)> = Vec::new();
+        if matches!(self.peek(), Token::Word(w) if w == "USING") {
+            self.advance();
+            loop {
+                let pn = self.expect_word_any();
+                let key = to_wei_ident(&pn);
+                let ty = linkage
+                    .iter()
+                    .find(|(n, _)| n == &key)
+                    .map(|(_, t)| t.clone())
+                    .unwrap_or_else(|| {
+                        panic!("cobol2wei: USING param `{}` not in LINKAGE", pn)
+                    });
+                params.push((key, ty));
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect_period();
+
+        let mut body: Vec<Stmt> = Vec::new();
+        loop {
+            if self.at_eof() {
+                break;
+            }
+            if matches!(self.peek(), Token::Word(w) if w == "IDENTIFICATION") {
+                break;
+            }
+            if let Token::Word(w) = self.peek() {
+                if !is_verb(w) && matches!(self.peek_n(1), Token::Period) {
+                    self.advance();
+                    self.expect_period();
+                    continue;
+                }
+            }
+            let s = self.parse_statement(false);
+            if matches!(s, Stmt::ExitProgram) {
+                break;
+            }
+            body.push(s);
+        }
+
+        SubDef {
+            name: sub_name,
+            params,
+            body,
+        }
     }
 
     fn parse_environment_division(&mut self, program: &mut Program) {
@@ -572,6 +769,9 @@ impl<'a> Parser<'a> {
             if self.at_eof() {
                 break;
             }
+            if matches!(self.peek(), Token::Word(w) if w == "IDENTIFICATION") {
+                break;
+            }
             if let Token::Word(w) = self.peek() {
                 if !is_verb(w) && matches!(self.peek_n(1), Token::Period) {
                     if using_main {
@@ -648,6 +848,67 @@ impl<'a> Parser<'a> {
                     target: to_wei_ident(&target),
                 }
             }
+            Token::Word(ref w) if w == "MULTIPLY" => {
+                self.advance();
+                let a = self.parse_expr();
+                self.expect_word("BY");
+                let b = self.parse_expr();
+                let (target, expr) = if matches!(self.peek(), Token::Word(w) if w == "GIVING") {
+                    self.advance();
+                    let c = self.expect_word_any();
+                    (to_wei_ident(&c), bin(ArithOp::Mul, a, b))
+                } else {
+                    let tgt = match &b {
+                        Expr::Ident(n) => n.clone(),
+                        _ => panic!("cobol2wei: MULTIPLY BY target must be an identifier"),
+                    };
+                    (tgt, bin(ArithOp::Mul, a, b))
+                };
+                self.end_stmt(in_block);
+                Stmt::Compute { target, expr }
+            }
+            Token::Word(ref w) if w == "DIVIDE" => {
+                self.advance();
+                let a = self.parse_expr();
+                let by_into = self.expect_word_any();
+                let b = self.parse_expr();
+                let (target, expr) = match by_into.as_str() {
+                    "INTO" => {
+                        if matches!(self.peek(), Token::Word(w) if w == "GIVING") {
+                            self.advance();
+                            let c = self.expect_word_any();
+                            (to_wei_ident(&c), bin(ArithOp::Div, b, a))
+                        } else {
+                            let tgt = match &b {
+                                Expr::Ident(n) => n.clone(),
+                                _ => panic!("cobol2wei: DIVIDE INTO target must be an identifier"),
+                            };
+                            (tgt, bin(ArithOp::Div, b, a))
+                        }
+                    }
+                    "BY" => {
+                        self.expect_word("GIVING");
+                        let c = self.expect_word_any();
+                        (to_wei_ident(&c), bin(ArithOp::Div, a, b))
+                    }
+                    other => panic!("cobol2wei: expected INTO or BY after DIVIDE, got {}", other),
+                };
+                self.end_stmt(in_block);
+                Stmt::Compute { target, expr }
+            }
+            Token::Word(ref w) if w == "COMPUTE" => {
+                self.advance();
+                let target = self.expect_word_any();
+                if !matches!(self.advance(), Token::Eq) {
+                    panic!("cobol2wei: expected `=` after COMPUTE target");
+                }
+                let expr = self.parse_arith_expr();
+                self.end_stmt(in_block);
+                Stmt::Compute {
+                    target: to_wei_ident(&target),
+                    expr,
+                }
+            }
             Token::Word(ref w) if w == "PERFORM" => {
                 self.advance();
                 if matches!(self.peek(), Token::Word(w) if w == "UNTIL") {
@@ -663,11 +924,17 @@ impl<'a> Parser<'a> {
                     self.expect_word("END-PERFORM");
                     self.end_stmt(in_block);
                     Stmt::PerformUntil { cond, body }
+                } else if matches!(self.peek(), Token::Word(w) if w == "VARYING") {
+                    self.parse_varying(None, in_block)
                 } else {
                     let para = self.expect_word_any();
-                    self.end_stmt(in_block);
-                    Stmt::Perform {
-                        para: to_wei_ident(&para),
+                    if matches!(self.peek(), Token::Word(w) if w == "VARYING") {
+                        self.parse_varying(Some(to_wei_ident(&para)), in_block)
+                    } else {
+                        self.end_stmt(in_block);
+                        Stmt::Perform {
+                            para: to_wei_ident(&para),
+                        }
                     }
                 }
             }
@@ -794,7 +1061,89 @@ impl<'a> Parser<'a> {
                 self.end_stmt(in_block);
                 Stmt::StopRun
             }
+            Token::Word(ref w) if w == "EXIT" => {
+                self.advance();
+                self.expect_word("PROGRAM");
+                self.end_stmt(in_block);
+                Stmt::ExitProgram
+            }
+            Token::Word(ref w) if w == "CALL" => {
+                self.advance();
+                let name_cobol = match self.advance() {
+                    Token::StringLit(s) => s,
+                    Token::Word(w) => w,
+                    other => panic!("cobol2wei: CALL expected program name, got {:?}", other),
+                };
+                let mut args = Vec::new();
+                if matches!(self.peek(), Token::Word(w) if w == "USING") {
+                    self.advance();
+                    loop {
+                        args.push(self.parse_expr());
+                        if matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.end_stmt(in_block);
+                Stmt::CallSub {
+                    name: to_wei_ident(&name_cobol),
+                    args,
+                }
+            }
             other => panic!("cobol2wei: unsupported statement starting with {:?}", other),
+        }
+    }
+
+    fn parse_varying(&mut self, para: Option<String>, in_block: bool) -> Stmt {
+        self.expect_word("VARYING");
+        let var_cobol = self.expect_word_any();
+        let var = to_wei_ident(&var_cobol);
+        self.expect_word("FROM");
+        let start = self.parse_expr();
+        self.expect_word("BY");
+        let step = self.expect_intlit();
+        if step != 1 {
+            panic!("cobol2wei: PERFORM VARYING BY != 1 not supported");
+        }
+        self.expect_word("UNTIL");
+        let cond = self.parse_condition();
+        let (end, end_inclusive) = match cond {
+            Cond::Cmp {
+                op,
+                left: Expr::Ident(n),
+                right,
+            } if n == var => match op {
+                CmpOp::Gt => (right, true),
+                CmpOp::Ge | CmpOp::Eq => (right, false),
+                _ => panic!(
+                    "cobol2wei: PERFORM VARYING UNTIL: only var > N, var >= N, var = N supported"
+                ),
+            },
+            _ => panic!("cobol2wei: PERFORM VARYING UNTIL: condition must compare loop var"),
+        };
+        let body = if let Some(para_name) = para {
+            self.end_stmt(in_block);
+            vec![Stmt::Perform { para: para_name }]
+        } else {
+            let mut body = Vec::new();
+            while !matches!(self.peek(), Token::Word(w) if w == "END-PERFORM") {
+                if self.at_eof() {
+                    panic!("cobol2wei: unterminated PERFORM VARYING (missing END-PERFORM)");
+                }
+                body.push(self.parse_statement(true));
+            }
+            self.expect_word("END-PERFORM");
+            self.end_stmt(in_block);
+            body
+        };
+        Stmt::ForRange {
+            var,
+            start,
+            end,
+            end_inclusive,
+            body,
         }
     }
 
@@ -889,6 +1238,52 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_arith_expr(&mut self) -> Expr {
+        self.parse_arith_add()
+    }
+
+    fn parse_arith_add(&mut self) -> Expr {
+        let mut left = self.parse_arith_mul();
+        loop {
+            let op = match self.peek() {
+                Token::Plus => ArithOp::Add,
+                Token::Minus => ArithOp::Sub,
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_arith_mul();
+            left = bin(op, left, right);
+        }
+        left
+    }
+
+    fn parse_arith_mul(&mut self) -> Expr {
+        let mut left = self.parse_arith_atom();
+        loop {
+            let op = match self.peek() {
+                Token::Star => ArithOp::Mul,
+                Token::Slash => ArithOp::Div,
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_arith_atom();
+            left = bin(op, left, right);
+        }
+        left
+    }
+
+    fn parse_arith_atom(&mut self) -> Expr {
+        match self.peek().clone() {
+            Token::LParen => {
+                self.advance();
+                let e = self.parse_arith_expr();
+                self.expect_rparen();
+                e
+            }
+            _ => self.parse_expr(),
+        }
+    }
+
     fn end_stmt(&mut self, in_block: bool) {
         if in_block {
             if matches!(self.peek(), Token::Period) {
@@ -955,6 +1350,8 @@ fn is_verb(w: &str) -> bool {
             | "COMPUTE"
             | "SET"
             | "WHEN"
+            | "CALL"
+            | "EXIT"
             | "END-EVALUATE"
             | "END-IF"
             | "END-PERFORM"
@@ -1042,6 +1439,10 @@ fn expr_wei(e: &Expr, r: &Resolved) -> String {
         Expr::Ident(n) => qualified(n, r),
         Expr::Int(v) => v.to_string(),
         Expr::Str(s) => format!("\"{}\"", s),
+        Expr::Bin { op, left, right } => {
+            let s = arith_sym(*op);
+            format!("({} {} {})", expr_wei(left, r), s, expr_wei(right, r))
+        }
     }
 }
 
@@ -1050,6 +1451,27 @@ fn expr_cobol(e: &Expr) -> String {
         Expr::Ident(n) => to_cobol_name(n),
         Expr::Int(v) => v.to_string(),
         Expr::Str(s) => format!("\"{}\"", s),
+        Expr::Bin { op, left, right } => {
+            let s = arith_sym(*op);
+            format!("({} {} {})", expr_cobol(left), s, expr_cobol(right))
+        }
+    }
+}
+
+fn arith_sym(op: ArithOp) -> &'static str {
+    match op {
+        ArithOp::Add => "+",
+        ArithOp::Sub => "-",
+        ArithOp::Mul => "*",
+        ArithOp::Div => "/",
+    }
+}
+
+fn bin(op: ArithOp, left: Expr, right: Expr) -> Expr {
+    Expr::Bin {
+        op,
+        left: Box::new(left),
+        right: Box::new(right),
     }
 }
 
@@ -1086,9 +1508,12 @@ fn cond_wei(c: &Cond, r: &Resolved) -> String {
         Cond::Bare(n) => {
             if let Some(file) = r.file_for_eighty_eight.get(n) {
                 format!("at_end({})", file)
+            } else if r.eighty_eight_parent.contains_key(n) {
+                // General 88-level reference — wei evaluates `n` to (parent == value).
+                n.clone()
             } else {
                 panic!(
-                    "cobol2wei: unsupported: bare condition `{}` (only 88-level EOF pattern supported)",
+                    "cobol2wei: unknown bare condition `{}`",
                     to_cobol_name(n)
                 );
             }
@@ -1128,6 +1553,28 @@ fn emit(program: &Program) -> String {
         out.push('\n');
     }
 
+    for sub in &program.subs {
+        out.push_str(&format!(
+            "// COBOL: PROGRAM-ID. {}.\n",
+            to_cobol_name(&sub.name)
+        ));
+        let plist: Vec<String> = sub
+            .params
+            .iter()
+            .map(|(pn, pt)| format!("{} {}", pn, pic_to_str(pt)))
+            .collect();
+        out.push_str(&format!("sub {}({}):\n", sub.name, plist.join(", ")));
+        if sub.body.is_empty() {
+            out.push_str("    // empty\n");
+            out.push_str("    print(0)\n");
+        } else {
+            for s in &sub.body {
+                emit_stmt(&mut out, s, 1, &r);
+            }
+        }
+        out.push('\n');
+    }
+
     for f in &program.files {
         out.push_str(&format!(
             "// COBOL: SELECT {} ASSIGN TO \"{}\" ORGANIZATION IS {}.\n",
@@ -1161,6 +1608,20 @@ fn emit(program: &Program) -> String {
             None => {
                 out.push_str(&format!("let {} {}\n", s.name, ty_str));
             }
+        }
+        for (n88, v) in &s.eighty_eights {
+            let v_str = match v {
+                Literal::Int(n) => n.to_string(),
+                Literal::Str(_) => {
+                    panic!("cobol2wei: 88-level on non-EOF flag with string value not supported")
+                }
+            };
+            out.push_str(&format!(
+                "    // COBOL: 88 {} VALUE {}.\n",
+                to_cobol_name(n88),
+                v_str
+            ));
+            out.push_str(&format!("    is {} = {}\n", n88, v_str));
         }
     }
     if !program.ws_scalars.iter().all(|s| r.suppressed_flags.contains(&s.name))
@@ -1228,6 +1689,20 @@ fn emit_stmt(out: &mut String, s: &Stmt, indent: usize, r: &Resolved) {
                 expr_wei(value, r)
             ));
         }
+        Stmt::Compute { target, expr } => {
+            out.push_str(&format!(
+                "{}// COBOL: COMPUTE {} = {}.\n",
+                pad,
+                to_cobol_name(target),
+                expr_cobol(expr)
+            ));
+            out.push_str(&format!(
+                "{}{} = {}\n",
+                pad,
+                qualified(target, r),
+                expr_wei(expr, r)
+            ));
+        }
         Stmt::Subtract { value, target } => {
             out.push_str(&format!(
                 "{}// COBOL: SUBTRACT {} FROM {}.\n",
@@ -1251,6 +1726,34 @@ fn emit_stmt(out: &mut String, s: &Stmt, indent: usize, r: &Resolved) {
                 to_cobol_name(para)
             ));
             out.push_str(&format!("{}{}()\n", pad, para));
+        }
+        Stmt::ForRange {
+            var,
+            start,
+            end,
+            end_inclusive,
+            body,
+        } => {
+            let end_str = if *end_inclusive {
+                format!("({} + 1)", expr_wei(end, r))
+            } else {
+                expr_wei(end, r)
+            };
+            out.push_str(&format!(
+                "{}// COBOL: PERFORM VARYING {} ...\n",
+                pad,
+                to_cobol_name(var)
+            ));
+            out.push_str(&format!(
+                "{}for {} in {}..{}:\n",
+                pad,
+                var,
+                expr_wei(start, r),
+                end_str
+            ));
+            for s in body {
+                emit_stmt(out, s, indent + 1, r);
+            }
         }
         Stmt::PerformUntil { cond, body } => {
             out.push_str(&format!(
@@ -1347,6 +1850,20 @@ fn emit_stmt(out: &mut String, s: &Stmt, indent: usize, r: &Resolved) {
                     }
                 }
             }
+        }
+        Stmt::CallSub { name, args } => {
+            let arg_str: Vec<String> = args.iter().map(|a| expr_wei(a, r)).collect();
+            let arg_str_cobol: Vec<String> = args.iter().map(expr_cobol).collect();
+            out.push_str(&format!(
+                "{}// COBOL: CALL \"{}\" USING {}.\n",
+                pad,
+                to_cobol_name(name),
+                arg_str_cobol.join(", ")
+            ));
+            out.push_str(&format!("{}{}({})\n", pad, name, arg_str.join(", ")));
+        }
+        Stmt::ExitProgram => {
+            out.push_str(&format!("{}// COBOL: EXIT PROGRAM.\n", pad));
         }
         Stmt::StopRun => {
             out.push_str(&format!("{}// COBOL: STOP RUN.\n", pad));

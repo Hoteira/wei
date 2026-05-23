@@ -22,11 +22,13 @@ pub fn emit(program: &Program) -> Vec<u8> {
     g.collect_symbols(program);
     g.collect_files(program);
     g.register_paragraphs(program);
+    g.register_subs(program);
+    g.register_eighty_eights(program);
 
     for stmt in &program.statements {
         if !matches!(
             stmt,
-            Stmt::Par { .. } | Stmt::TypeDef { .. } | Stmt::FileDecl { .. }
+            Stmt::Par { .. } | Stmt::Sub { .. } | Stmt::TypeDef { .. } | Stmt::FileDecl { .. }
         ) {
             g.emit_stmt(stmt);
         }
@@ -35,6 +37,13 @@ pub fn emit(program: &Program) -> Vec<u8> {
 
     for stmt in &program.statements {
         if let Stmt::Par { name, body } = stmt {
+            g.start_paragraph(name);
+            for s in body {
+                g.emit_stmt(s);
+            }
+            g.emit_ret();
+        }
+        if let Stmt::Sub { name, body, .. } = stmt {
             g.start_paragraph(name);
             for s in body {
                 g.emit_stmt(s);
@@ -76,6 +85,8 @@ struct Codegen {
     paragraphs: Vec<(String, Option<usize>)>,
     par_calls: Vec<(usize, String)>,
     record_types: HashMap<String, RecordInfo>,
+    subs: Vec<(String, Vec<(String, TypeExpr)>)>,
+    eighty_eights: HashMap<String, (String, i64)>,
 }
 
 impl Codegen {
@@ -90,6 +101,112 @@ impl Codegen {
             paragraphs: Vec::new(),
             par_calls: Vec::new(),
             record_types: HashMap::new(),
+            subs: Vec::new(),
+            eighty_eights: HashMap::new(),
+        }
+    }
+
+    fn register_eighty_eights(&mut self, program: &Program) {
+        for stmt in &program.statements {
+            self.collect_eighty_eights_in(stmt);
+        }
+    }
+
+    fn collect_eighty_eights_in(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Let {
+                name,
+                eighty_eights,
+                ..
+            } => {
+                for (n88, v) in eighty_eights {
+                    let int_val = match v {
+                        Expr::IntLit(n) => *n,
+                        _ => panic!(
+                            "codegen: 88-level `{}`: value must be integer literal",
+                            n88
+                        ),
+                    };
+                    self.eighty_eights
+                        .insert(n88.clone(), (name.clone(), int_val));
+                }
+            }
+            Stmt::Par { body, .. } | Stmt::Sub { body, .. } => {
+                for s in body {
+                    self.collect_eighty_eights_in(s);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn register_subs(&mut self, program: &Program) {
+        for stmt in &program.statements {
+            if let Stmt::Sub { name, params, body: _ } = stmt {
+                if self.paragraphs.iter().any(|(n, _)| n == name) {
+                    panic!("codegen: sub `{}` conflicts with paragraph or sub of same name", name);
+                }
+                self.paragraphs.push((name.clone(), None));
+                self.subs.push((name.clone(), params.clone()));
+                for (pname, pty) in params {
+                    let size = match pty {
+                        TypeExpr::UInt(_) | TypeExpr::UDec(_, _) | TypeExpr::IDec(_, _) => 8usize,
+                        TypeExpr::Str(n) => *n as usize,
+                        other => panic!("codegen: sub param type {:?} not supported", other),
+                    };
+                    if self.symbols.iter().any(|s| s.name == *pname) {
+                        panic!("codegen: sub param `{}` conflicts with existing symbol", pname);
+                    }
+                    let offset = self.data.len() as u64;
+                    self.data.extend_from_slice(&vec![0u8; size]);
+                    self.symbols.push(Symbol {
+                        name: pname.clone(),
+                        offset_in_data: offset,
+                        ty: pty.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    fn is_sub(&self, name: &str) -> bool {
+        self.subs.iter().any(|(n, _)| n == name)
+    }
+
+    fn emit_call_sub(&mut self, name: &str, args: &[Expr]) {
+        let params: Vec<(String, TypeExpr)> = self
+            .subs
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap()
+            .1
+            .clone();
+        if args.len() != params.len() {
+            panic!(
+                "codegen: sub `{}` expects {} args, got {}",
+                name,
+                params.len(),
+                args.len()
+            );
+        }
+        for (i, arg) in args.iter().enumerate() {
+            let (pname, _) = &params[i];
+            self.emit_expr(arg);
+            let param_slot = self.lookup_symbol(pname).offset_in_data;
+            self.emit_mov_imm64_reloc(RBX, param_slot);
+            self.emit_mov_at_rbx_rax();
+        }
+        self.emit_call_paragraph(name);
+        for (i, arg) in args.iter().enumerate() {
+            if let Expr::Ident(arg_name) = arg {
+                let (pname, _) = &params[i];
+                let param_slot = self.lookup_symbol(pname).offset_in_data;
+                let arg_slot = self.lookup_symbol(arg_name).offset_in_data;
+                self.emit_mov_imm64_reloc(RBX, param_slot);
+                self.emit_mov_rax_from_rbx();
+                self.emit_mov_imm64_reloc(RBX, arg_slot);
+                self.emit_mov_at_rbx_rax();
+            }
         }
     }
 
@@ -291,7 +408,7 @@ impl Codegen {
 
     fn collect_symbols(&mut self, program: &Program) {
         for stmt in &program.statements {
-            if let Stmt::Let { name, ty, init } = stmt {
+            if let Stmt::Let { name, ty, init, eighty_eights: _ } = stmt {
                 let offset = self.data.len() as u64;
                 match (ty, init) {
                     (TypeExpr::UInt(_), Some(init_expr)) => {
@@ -396,6 +513,7 @@ impl Codegen {
         match stmt {
             Stmt::Let { .. }
             | Stmt::Par { .. }
+            | Stmt::Sub { .. }
             | Stmt::TypeDef { .. }
             | Stmt::FileDecl { .. } => {}
             Stmt::Assign { target, value } => self.emit_assign(target, value),
@@ -421,6 +539,8 @@ impl Codegen {
                     self.emit_file_close(args);
                 } else if name == "read" {
                     self.emit_file_read(args);
+                } else if self.is_sub(name) {
+                    self.emit_call_sub(name, args);
                 } else if self.has_paragraph(name) {
                     if !args.is_empty() {
                         panic!("codegen: paragraph `{}` is param-less", name);
@@ -527,16 +647,19 @@ impl Codegen {
     }
 
     fn emit_for(&mut self, var: &str, start: &Expr, end: &Expr, body: &[Stmt]) {
-        if self.symbols.iter().any(|s| s.name == var) {
-            panic!("codegen: loop variable `{}` shadows existing symbol", var);
-        }
-        let var_offset = self.data.len() as u64;
-        self.data.extend_from_slice(&[0u8; 8]);
-        self.symbols.push(Symbol {
-            name: var.to_string(),
-            offset_in_data: var_offset,
-            ty: TypeExpr::UInt(18),
-        });
+        let existed = self.symbols.iter().any(|s| s.name == var);
+        let var_offset = if existed {
+            self.lookup_symbol(var).offset_in_data
+        } else {
+            let off = self.data.len() as u64;
+            self.data.extend_from_slice(&[0u8; 8]);
+            self.symbols.push(Symbol {
+                name: var.to_string(),
+                offset_in_data: off,
+                ty: TypeExpr::UInt(18),
+            });
+            off
+        };
 
         self.emit_expr(start);
         self.emit_mov_imm64_reloc(RBX, var_offset);
@@ -568,7 +691,9 @@ impl Codegen {
 
         self.emit_add_rsp_imm8(8);
 
-        self.symbols.pop();
+        if !existed {
+            self.symbols.pop();
+        }
     }
 
     fn emit_assign(&mut self, target: &LValue, value: &Expr) {
@@ -733,9 +858,19 @@ impl Codegen {
                 self.emit_mov_imm64(RAX, *scaled as u64);
             }
             Expr::Ident(name) => {
-                let offset = self.lookup_symbol(name).offset_in_data;
-                self.emit_mov_imm64_reloc(RBX, offset);
-                self.emit_mov_rax_from_rbx();
+                if let Some((parent, value)) = self.eighty_eights.get(name).cloned() {
+                    let parent_offset = self.lookup_symbol(&parent).offset_in_data;
+                    self.emit_mov_imm64_reloc(RBX, parent_offset);
+                    self.emit_mov_rax_from_rbx();
+                    self.emit_mov_imm64(RBX, value as u64);
+                    self.emit_cmp_rax_rbx();
+                    self.emit_setcc_dl(CmpOp::Eq);
+                    self.emit_movzx_eax_dl();
+                } else {
+                    let offset = self.lookup_symbol(name).offset_in_data;
+                    self.emit_mov_imm64_reloc(RBX, offset);
+                    self.emit_mov_rax_from_rbx();
+                }
             }
             Expr::BinaryOp { op, left, right } => {
                 self.emit_expr(left);

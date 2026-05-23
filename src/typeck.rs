@@ -25,6 +25,11 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
             }
             c.symbols.insert(name.clone(), TypeExpr::File);
         }
+        if let Stmt::Sub { params, .. } = stmt {
+            for (pname, pty) in params {
+                c.symbols.insert(pname.clone(), pty.clone());
+            }
+        }
     }
 
     c.check_block(&program.statements);
@@ -51,7 +56,10 @@ impl Checker {
     fn check_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::TypeDef { .. } => {}
-            Stmt::Let { name, ty, init } => {
+            Stmt::Let { name, ty, init, eighty_eights } => {
+                for (n88, _) in eighty_eights {
+                    self.symbols.insert(n88.clone(), TypeExpr::UInt(1));
+                }
                 if let TypeExpr::Record(rname) = ty {
                     if !self.records.contains_key(rname) {
                         self.errors.push(format!(
@@ -112,6 +120,9 @@ impl Checker {
             Stmt::Par { body, .. } => {
                 self.check_block(body);
             }
+            Stmt::Sub { body, .. } => {
+                self.check_block(body);
+            }
             Stmt::While { body, .. } => {
                 self.check_block(body);
             }
@@ -129,15 +140,12 @@ impl Checker {
                 }
             }
             Stmt::For { var, body, .. } => {
-                if self.symbols.contains_key(var) {
-                    self.errors.push(format!(
-                        "loop variable `{}` shadows existing symbol",
-                        var
-                    ));
-                    self.check_block(body);
-                } else {
+                let existed = self.symbols.contains_key(var);
+                if !existed {
                     self.symbols.insert(var.clone(), TypeExpr::UInt(18));
-                    self.check_block(body);
+                }
+                self.check_block(body);
+                if !existed {
                     self.symbols.remove(var);
                 }
             }

@@ -9,6 +9,7 @@ pub enum Stmt {
         name: String,
         ty: TypeExpr,
         init: Option<Expr>,
+        eighty_eights: Vec<(String, Expr)>,
     },
     Assign {
         target: LValue,
@@ -49,6 +50,11 @@ pub enum Stmt {
         name: String,
         path: String,
         mode: String,
+    },
+    Sub {
+        name: String,
+        params: Vec<(String, TypeExpr)>,
+        body: Vec<Stmt>,
     },
 }
 

@@ -1,0 +1,21 @@
+let status uint(3) = 1
+    is is_ok = 1
+    is is_warn = 2
+    is is_err = 3
+
+par main:
+    if is_ok:
+        print(1)
+    if is_err:
+        print(9)
+    else:
+        print(2)
+    status = 3
+    if is_err:
+        print(3)
+    if is_warn:
+        print(9)
+    else:
+        print(4)
+
+main()

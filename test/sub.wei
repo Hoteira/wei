@@ -1,0 +1,17 @@
+let amt uint(5) = 1500
+let stat uint(3) = 0
+
+sub payroll(in_amt uint(5), out_stat uint(3)):
+    if in_amt > 1000:
+        out_stat = 1
+    else:
+        out_stat = 0
+
+par main:
+    payroll(amt, stat)
+    print(stat)
+    amt = 500
+    payroll(amt, stat)
+    print(stat)
+
+main()  
