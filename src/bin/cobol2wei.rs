@@ -8,6 +8,7 @@ enum Token {
     Word(String),
     StringLit(String),
     IntLit(i64),
+    DecLit(i64, u32),
     LParen,
     RParen,
     Period,
@@ -100,11 +101,26 @@ fn lex(source: &str) -> Vec<Token> {
             while i < bytes.len() && bytes[i].is_ascii_digit() {
                 i += 1;
             }
-            let v: i64 = std::str::from_utf8(&bytes[start..i])
-                .unwrap()
-                .parse()
-                .expect("cobol2wei: invalid integer");
-            tokens.push(Token::IntLit(v));
+            if i + 1 < bytes.len() && bytes[i] == b'.' && bytes[i + 1].is_ascii_digit() {
+                let int_end = i;
+                i += 1; // consume '.'
+                let frac_start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let frac_digits = (i - frac_start) as u32;
+                let int_str = std::str::from_utf8(&bytes[start..int_end]).unwrap();
+                let frac_str = std::str::from_utf8(&bytes[frac_start..i]).unwrap();
+                let combined = format!("{}{}", int_str, frac_str);
+                let value: i64 = combined.parse().expect("cobol2wei: invalid decimal");
+                tokens.push(Token::DecLit(value, frac_digits));
+            } else {
+                let v: i64 = std::str::from_utf8(&bytes[start..i])
+                    .unwrap()
+                    .parse()
+                    .expect("cobol2wei: invalid integer");
+                tokens.push(Token::IntLit(v));
+            }
         } else if b.is_ascii_alphabetic() || b == b'_' {
             let start = i;
             while i < bytes.len()
@@ -133,6 +149,7 @@ enum PicType {
     Str(u32),
     UInt(u32),
     UDec(u32, u32),
+    Array(Box<PicType>, u32),
 }
 
 #[derive(Debug, Clone)]
@@ -187,7 +204,9 @@ struct FdBinding {
 enum Expr {
     Ident(String),
     Int(i64),
+    Dec(i64, u32),
     Str(String),
+    Index { base: Box<Expr>, idx: Box<Expr> },
     Bin {
         op: ArithOp,
         left: Box<Expr>,
@@ -224,7 +243,7 @@ enum Cond {
 #[derive(Debug)]
 enum Stmt {
     Display(Expr),
-    Move { value: Expr, target: String },
+    Move { value: Expr, target: String, target_idx: Option<Expr> },
     Add { value: Expr, target: String },
     Subtract { value: Expr, target: String },
     Compute { target: String, expr: Expr },
@@ -245,10 +264,14 @@ enum Stmt {
     Open { mode: String, file: String },
     Read { file: String, at_end_target: Option<String> },
     Write { rec: String },
+    Rewrite { rec: String },
     Close { file: String },
     Evaluate { expr: Expr, arms: Vec<EvalArm> },
     CallSub { name: String, args: Vec<Expr> },
     InspectTally { subject: String, counter: String, needle: String },
+    InspectReplace { subject: String, needle: String, replacement: String },
+    StringConcat { target: String, sources: Vec<Expr> },
+    Unstring { src: String, delim: String, targets: Vec<String> },
     Goto { label: String },
     ExitProgram,
     StopRun,
@@ -691,7 +714,15 @@ impl<'a> Parser<'a> {
                         continue;
                     }
                     self.expect_word("PIC");
-                    let ty = self.parse_pic();
+                    let mut ty = self.parse_pic();
+                    if matches!(self.peek(), Token::Word(w) if w == "OCCURS") {
+                        self.advance();
+                        let n = self.expect_intlit();
+                        if matches!(self.peek(), Token::Word(w) if w == "TIMES") {
+                            self.advance();
+                        }
+                        ty = PicType::Array(Box::new(ty), n as u32);
+                    }
                     let value = if matches!(self.peek(), Token::Word(w) if w == "VALUE") {
                         self.advance();
                         Some(self.parse_literal())
@@ -749,7 +780,15 @@ impl<'a> Parser<'a> {
             };
             if matches!(self.peek(), Token::Word(w) if w == "PIC") {
                 self.advance();
-                let ty = self.parse_pic();
+                let mut ty = self.parse_pic();
+                if matches!(self.peek(), Token::Word(w) if w == "OCCURS") {
+                    self.advance();
+                    let n = self.expect_intlit();
+                    if matches!(self.peek(), Token::Word(w) if w == "TIMES") {
+                        self.advance();
+                    }
+                    ty = PicType::Array(Box::new(ty), n as u32);
+                }
                 self.expect_period();
                 fields.push(RecField {
                     name: fname,
@@ -882,10 +921,19 @@ impl<'a> Parser<'a> {
                 let value = self.parse_expr();
                 self.expect_word("TO");
                 let target = self.expect_word_any();
+                let target_idx = if matches!(self.peek(), Token::LParen) {
+                    self.advance();
+                    let idx = self.parse_expr();
+                    self.expect_rparen();
+                    Some(idx)
+                } else {
+                    None
+                };
                 self.end_stmt(in_block);
                 Stmt::Move {
                     value,
                     target: to_wei_ident(&target),
+                    target_idx,
                 }
             }
             Token::Word(ref w) if w == "ADD" => {
@@ -1034,6 +1082,14 @@ impl<'a> Parser<'a> {
                     rec: to_wei_ident(&rec_cobol),
                 }
             }
+            Token::Word(ref w) if w == "REWRITE" => {
+                self.advance();
+                let rec_cobol = self.expect_word_any();
+                self.end_stmt(in_block);
+                Stmt::Rewrite {
+                    rec: to_wei_ident(&rec_cobol),
+                }
+            }
             Token::Word(ref w) if w == "READ" => {
                 self.advance();
                 let file = self.expect_word_any();
@@ -1131,25 +1187,100 @@ impl<'a> Parser<'a> {
                 self.end_stmt(in_block);
                 Stmt::Evaluate { expr, arms }
             }
-            Token::Word(ref w) if w == "INSPECT" => {
+            Token::Word(ref w) if w == "STRING" => {
                 self.advance();
-                let subject = self.expect_word_any();
-                self.expect_word("TALLYING");
-                let counter = self.expect_word_any();
-                self.expect_word("FOR");
-                self.expect_word("ALL");
-                let needle = match self.advance() {
+                let mut sources = Vec::new();
+                sources.push(self.parse_expr());
+                while !matches!(self.peek(), Token::Word(w) if w == "DELIMITED") {
+                    sources.push(self.parse_expr());
+                }
+                self.expect_word("DELIMITED");
+                self.expect_word("BY");
+                self.expect_word("SIZE");
+                self.expect_word("INTO");
+                let target = self.expect_word_any();
+                self.end_stmt(in_block);
+                Stmt::StringConcat {
+                    target: to_wei_ident(&target),
+                    sources,
+                }
+            }
+            Token::Word(ref w) if w == "UNSTRING" => {
+                self.advance();
+                let src = self.expect_word_any();
+                self.expect_word("DELIMITED");
+                self.expect_word("BY");
+                let delim = match self.advance() {
                     Token::StringLit(s) => s,
                     other => panic!(
-                        "cobol2wei: INSPECT FOR ALL expected string literal, got {:?}",
+                        "cobol2wei: UNSTRING DELIMITED BY expected string literal, got {:?}",
                         other
                     ),
                 };
+                self.expect_word("INTO");
+                let mut targets = Vec::new();
+                let first = self.expect_word_any();
+                targets.push(to_wei_ident(&first));
+                while matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    let t = self.expect_word_any();
+                    targets.push(to_wei_ident(&t));
+                }
                 self.end_stmt(in_block);
-                Stmt::InspectTally {
-                    subject: to_wei_ident(&subject),
-                    counter: to_wei_ident(&counter),
-                    needle,
+                Stmt::Unstring {
+                    src: to_wei_ident(&src),
+                    delim,
+                    targets,
+                }
+            }
+            Token::Word(ref w) if w == "INSPECT" => {
+                self.advance();
+                let subject = self.expect_word_any();
+                let verb = self.expect_word_any();
+                match verb.as_str() {
+                    "TALLYING" => {
+                        let counter = self.expect_word_any();
+                        self.expect_word("FOR");
+                        self.expect_word("ALL");
+                        let needle = match self.advance() {
+                            Token::StringLit(s) => s,
+                            other => panic!(
+                                "cobol2wei: INSPECT FOR ALL expected string literal, got {:?}",
+                                other
+                            ),
+                        };
+                        self.end_stmt(in_block);
+                        Stmt::InspectTally {
+                            subject: to_wei_ident(&subject),
+                            counter: to_wei_ident(&counter),
+                            needle,
+                        }
+                    }
+                    "REPLACING" => {
+                        self.expect_word("ALL");
+                        let needle = match self.advance() {
+                            Token::StringLit(s) => s,
+                            other => panic!(
+                                "cobol2wei: INSPECT REPLACING ALL expected string literal, got {:?}",
+                                other
+                            ),
+                        };
+                        self.expect_word("BY");
+                        let replacement = match self.advance() {
+                            Token::StringLit(s) => s,
+                            other => panic!(
+                                "cobol2wei: INSPECT REPLACING BY expected string literal, got {:?}",
+                                other
+                            ),
+                        };
+                        self.end_stmt(in_block);
+                        Stmt::InspectReplace {
+                            subject: to_wei_ident(&subject),
+                            needle,
+                            replacement,
+                        }
+                    }
+                    other => panic!("cobol2wei: INSPECT: expected TALLYING or REPLACING, got `{}`", other),
                 }
             }
             Token::Word(ref w) if w == "GO" => {
@@ -1338,8 +1469,22 @@ impl<'a> Parser<'a> {
     fn parse_expr(&mut self) -> Expr {
         match self.advance() {
             Token::IntLit(n) => Expr::Int(n),
+            Token::DecLit(v, s) => Expr::Dec(v, s),
             Token::StringLit(s) => Expr::Str(s),
-            Token::Word(w) => Expr::Ident(to_wei_ident(&w)),
+            Token::Word(w) => {
+                let name = to_wei_ident(&w);
+                if matches!(self.peek(), Token::LParen) {
+                    self.advance();
+                    let idx = self.parse_expr();
+                    self.expect_rparen();
+                    Expr::Index {
+                        base: Box::new(Expr::Ident(name)),
+                        idx: Box::new(idx),
+                    }
+                } else {
+                    Expr::Ident(name)
+                }
+            }
             other => panic!("cobol2wei: expected expression, got {:?}", other),
         }
     }
@@ -1454,6 +1599,8 @@ fn is_verb(w: &str) -> bool {
             | "REWRITE"
             | "GO"
             | "INSPECT"
+            | "STRING"
+            | "UNSTRING"
             | "IF"
             | "EVALUATE"
             | "COMPUTE"
@@ -1538,6 +1685,7 @@ fn pic_to_str(ty: &PicType) -> String {
         PicType::Str(n) => format!("str({})", n),
         PicType::UInt(n) => format!("uint({})", n),
         PicType::UDec(n, m) => format!("udec({},{})", n, m),
+        PicType::Array(elem, n) => format!("{}[{}]", pic_to_str(elem), n),
     }
 }
 
@@ -1553,7 +1701,11 @@ fn expr_wei(e: &Expr, r: &Resolved) -> String {
     match e {
         Expr::Ident(n) => qualified(n, r),
         Expr::Int(v) => v.to_string(),
+        Expr::Dec(v, s) => format_dec(*v, *s),
         Expr::Str(s) => format!("\"{}\"", s),
+        Expr::Index { base, idx } => {
+            format!("{}[{}]", expr_wei(base, r), expr_wei(idx, r))
+        }
         Expr::Bin { op, left, right } => {
             let s = arith_sym(*op);
             format!("({} {} {})", expr_wei(left, r), s, expr_wei(right, r))
@@ -1565,11 +1717,28 @@ fn expr_cobol(e: &Expr) -> String {
     match e {
         Expr::Ident(n) => to_cobol_name(n),
         Expr::Int(v) => v.to_string(),
+        Expr::Dec(v, s) => format_dec(*v, *s),
         Expr::Str(s) => format!("\"{}\"", s),
+        Expr::Index { base, idx } => {
+            format!("{}({})", expr_cobol(base), expr_cobol(idx))
+        }
         Expr::Bin { op, left, right } => {
             let s = arith_sym(*op);
             format!("({} {} {})", expr_cobol(left), s, expr_cobol(right))
         }
+    }
+}
+
+fn format_dec(scaled: i64, scale: u32) -> String {
+    let s = scaled.unsigned_abs().to_string();
+    let scale = scale as usize;
+    let sign = if scaled < 0 { "-" } else { "" };
+    if s.len() > scale {
+        let cut = s.len() - scale;
+        format!("{}{}.{}", sign, &s[..cut], &s[cut..])
+    } else {
+        let zeros = "0".repeat(scale - s.len());
+        format!("{}0.{}{}", sign, zeros, s)
     }
 }
 
@@ -1802,17 +1971,24 @@ fn emit_stmt(out: &mut String, s: &Stmt, indent: usize, r: &Resolved) {
             out.push_str(&format!("{}// COBOL: DISPLAY {}.\n", pad, expr_cobol(e)));
             out.push_str(&format!("{}print({})\n", pad, expr_wei(e, r)));
         }
-        Stmt::Move { value, target } => {
+        Stmt::Move { value, target, target_idx } => {
+            let (target_str_wei, target_str_cobol) = match target_idx {
+                Some(idx) => (
+                    format!("{}[{}]", qualified(target, r), expr_wei(idx, r)),
+                    format!("{}({})", to_cobol_name(target), expr_cobol(idx)),
+                ),
+                None => (qualified(target, r), to_cobol_name(target)),
+            };
             out.push_str(&format!(
                 "{}// COBOL: MOVE {} TO {}.\n",
                 pad,
                 expr_cobol(value),
-                to_cobol_name(target)
+                target_str_cobol
             ));
             out.push_str(&format!(
                 "{}{} = {}\n",
                 pad,
-                qualified(target, r),
+                target_str_wei,
                 expr_wei(value, r)
             ));
         }
@@ -1946,6 +2122,13 @@ fn emit_stmt(out: &mut String, s: &Stmt, indent: usize, r: &Resolved) {
             out.push_str(&format!("{}// COBOL: WRITE {}.\n", pad, to_cobol_name(rec)));
             out.push_str(&format!("{}write({}, {})\n", pad, file, rec));
         }
+        Stmt::Rewrite { rec } => {
+            let file = r.record_to_file.get(rec).unwrap_or_else(|| {
+                panic!("cobol2wei: REWRITE `{}` has no FD binding", to_cobol_name(rec))
+            });
+            out.push_str(&format!("{}// COBOL: REWRITE {}.\n", pad, to_cobol_name(rec)));
+            out.push_str(&format!("{}rewrite({}, {})\n", pad, file, rec));
+        }
         Stmt::Close { file } => {
             out.push_str(&format!("{}// COBOL: CLOSE {}.\n", pad, to_cobol_name(file)));
             out.push_str(&format!("{}close({})\n", pad, file));
@@ -2034,6 +2217,64 @@ fn emit_stmt(out: &mut String, s: &Stmt, indent: usize, r: &Resolved) {
                 qualified(counter, r),
                 qualified(subject, r),
                 needle
+            ));
+        }
+        Stmt::StringConcat { target, sources } => {
+            let src_strs: Vec<String> = sources.iter().map(|s| expr_wei(s, r)).collect();
+            let src_cobol: Vec<String> = sources.iter().map(expr_cobol).collect();
+            out.push_str(&format!(
+                "{}// COBOL: STRING {} DELIMITED BY SIZE INTO {}.\n",
+                pad,
+                src_cobol.join(" "),
+                to_cobol_name(target)
+            ));
+            out.push_str(&format!(
+                "{}string_concat({}, {})\n",
+                pad,
+                qualified(target, r),
+                src_strs.join(", ")
+            ));
+        }
+        Stmt::Unstring {
+            src,
+            delim,
+            targets,
+        } => {
+            let tgt_strs: Vec<String> = targets.iter().map(|t| qualified(t, r)).collect();
+            let tgt_cobol: Vec<String> = targets.iter().map(|t| to_cobol_name(t)).collect();
+            out.push_str(&format!(
+                "{}// COBOL: UNSTRING {} DELIMITED BY \"{}\" INTO {}.\n",
+                pad,
+                to_cobol_name(src),
+                delim,
+                tgt_cobol.join(", ")
+            ));
+            out.push_str(&format!(
+                "{}unstring({}, \"{}\", {})\n",
+                pad,
+                qualified(src, r),
+                delim,
+                tgt_strs.join(", ")
+            ));
+        }
+        Stmt::InspectReplace {
+            subject,
+            needle,
+            replacement,
+        } => {
+            out.push_str(&format!(
+                "{}// COBOL: INSPECT {} REPLACING ALL \"{}\" BY \"{}\".\n",
+                pad,
+                to_cobol_name(subject),
+                needle,
+                replacement
+            ));
+            out.push_str(&format!(
+                "{}replace_chars({}, \"{}\", \"{}\")\n",
+                pad,
+                qualified(subject, r),
+                needle,
+                replacement
             ));
         }
         Stmt::Goto { label } => {

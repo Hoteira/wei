@@ -1,0 +1,2 @@
+sub doubler(x uint(3)):
+    x = x + x

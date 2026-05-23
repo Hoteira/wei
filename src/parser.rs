@@ -81,12 +81,30 @@ impl<'a> Parser<'a> {
             return false;
         }
         p += 1;
-        while matches!(self.tokens.get(p), Some(Token::Dot)) {
-            p += 1;
-            if !matches!(self.tokens.get(p), Some(Token::Ident(_))) {
-                return false;
+        loop {
+            match self.tokens.get(p) {
+                Some(Token::Dot) => {
+                    p += 1;
+                    if !matches!(self.tokens.get(p), Some(Token::Ident(_))) {
+                        return false;
+                    }
+                    p += 1;
+                }
+                Some(Token::LBracket) => {
+                    let mut depth = 1;
+                    p += 1;
+                    while depth > 0 {
+                        match self.tokens.get(p) {
+                            Some(Token::LBracket) => depth += 1,
+                            Some(Token::RBracket) => depth -= 1,
+                            Some(Token::Eof) | None => return false,
+                            _ => {}
+                        }
+                        p += 1;
+                    }
+                }
+                _ => break,
             }
-            p += 1;
         }
         matches!(self.tokens.get(p), Some(Token::Eq))
     }
@@ -140,13 +158,27 @@ impl<'a> Parser<'a> {
 
     fn parse_lvalue(&mut self) -> LValue {
         let mut lv = LValue::Ident(self.expect_ident());
-        while matches!(self.peek(), Token::Dot) {
-            self.pos += 1;
-            let field = self.expect_ident();
-            lv = LValue::Field {
-                base: Box::new(lv),
-                field,
-            };
+        loop {
+            match self.peek() {
+                Token::Dot => {
+                    self.pos += 1;
+                    let field = self.expect_ident();
+                    lv = LValue::Field {
+                        base: Box::new(lv),
+                        field,
+                    };
+                }
+                Token::LBracket => {
+                    self.pos += 1;
+                    let idx = self.parse_expr();
+                    self.expect_rbracket();
+                    lv = LValue::Index {
+                        base: Box::new(lv),
+                        idx: Box::new(idx),
+                    };
+                }
+                _ => break,
+            }
         }
         lv
     }
@@ -384,6 +416,21 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_type(&mut self) -> TypeExpr {
+        let primary = self.parse_primary_type();
+        if matches!(self.peek(), Token::LBracket) {
+            self.pos += 1;
+            let n = self.expect_intlit();
+            self.expect_rbracket();
+            TypeExpr::Array {
+                element: Box::new(primary),
+                length: n as u32,
+            }
+        } else {
+            primary
+        }
+    }
+
+    fn parse_primary_type(&mut self) -> TypeExpr {
         let name = self.expect_ident();
         if matches!(self.peek(), Token::LParen) {
             self.pos += 1;
@@ -407,6 +454,14 @@ impl<'a> Parser<'a> {
             }
         } else {
             TypeExpr::Record(name)
+        }
+    }
+
+    fn expect_rbracket(&mut self) {
+        let t = self.tokens[self.pos].clone();
+        self.pos += 1;
+        if !matches!(t, Token::RBracket) {
+            panic!("parse error: expected ']', got {:?}", t);
         }
     }
 
@@ -519,13 +574,27 @@ impl<'a> Parser<'a> {
 
     fn parse_postfix(&mut self) -> Expr {
         let mut expr = self.parse_atom();
-        while matches!(self.peek(), Token::Dot) {
-            self.pos += 1;
-            let field = self.expect_ident();
-            expr = Expr::FieldAccess {
-                base: Box::new(expr),
-                field,
-            };
+        loop {
+            match self.peek() {
+                Token::Dot => {
+                    self.pos += 1;
+                    let field = self.expect_ident();
+                    expr = Expr::FieldAccess {
+                        base: Box::new(expr),
+                        field,
+                    };
+                }
+                Token::LBracket => {
+                    self.pos += 1;
+                    let idx = self.parse_expr();
+                    self.expect_rbracket();
+                    expr = Expr::Index {
+                        base: Box::new(expr),
+                        idx: Box::new(idx),
+                    };
+                }
+                _ => break,
+            }
         }
         expr
     }

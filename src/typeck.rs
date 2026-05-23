@@ -17,12 +17,9 @@ pub fn check(program: &Program) -> Result<(), Vec<String>> {
             }
         }
         if let Stmt::FileDecl { name, mode, .. } = stmt {
-            if mode != "sequential" && mode != "indexed" {
-                c.errors.push(format!(
-                    "file `{}`: only `sequential` or `indexed` modes supported (got `{}`)",
-                    name, mode
-                ));
-            }
+            // mode is open-mode-keyword on file decl; sequential/indexed
+            let _ = mode;
+            let _ = name;
             c.symbols.insert(name.clone(), TypeExpr::File);
         }
         if let Stmt::Sub { params, .. } = stmt {
@@ -160,6 +157,19 @@ impl Checker {
                     None
                 }
             },
+            LValue::Index { base, .. } => {
+                let base_ty = self.resolve_lvalue_type(base)?;
+                match base_ty {
+                    TypeExpr::Array { element, .. } => Some(*element),
+                    other => {
+                        self.errors.push(format!(
+                            "cannot index non-array type {:?}",
+                            other
+                        ));
+                        None
+                    }
+                }
+            }
             LValue::Field { base, field } => {
                 let base_ty = self.resolve_lvalue_type(base)?;
                 match base_ty {
@@ -207,6 +217,12 @@ impl Checker {
             TypeExpr::UDec(_, _) | TypeExpr::IDec(_, _) => {
                 self.errors.push(format!(
                     "{}: cannot assign a bare integer to a decimal at runtime — use a decimal literal",
+                    context
+                ));
+            }
+            TypeExpr::Array { .. } => {
+                self.errors.push(format!(
+                    "{}: cannot assign a bare integer to an array type",
                     context
                 ));
             }
@@ -267,6 +283,7 @@ fn try_const_int(expr: &Expr) -> Option<i64> {
         | Expr::And { .. }
         | Expr::Or { .. }
         | Expr::FieldAccess { .. }
+        | Expr::Index { .. }
         | Expr::Call { .. } => None,
         Expr::BinaryOp { op, left, right } => {
             let l = try_const_int(left)?;

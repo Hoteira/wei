@@ -6,6 +6,8 @@ pub enum Token {
     DecLit(i64, u32),
     LParen,
     RParen,
+    LBracket,
+    RBracket,
     Comma,
     Plus,
     Minus,
@@ -89,6 +91,14 @@ pub fn lex(source: &str) -> Vec<Token> {
                 }
                 b')' => {
                     tokens.push(Token::RParen);
+                    i += 1;
+                }
+                b'[' => {
+                    tokens.push(Token::LBracket);
+                    i += 1;
+                }
+                b']' => {
+                    tokens.push(Token::RBracket);
                     i += 1;
                 }
                 b',' => {

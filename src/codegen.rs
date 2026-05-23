@@ -162,6 +162,17 @@ impl Codegen {
                     let size = match pty {
                         TypeExpr::UInt(_) | TypeExpr::UDec(_, _) | TypeExpr::IDec(_, _) => 8usize,
                         TypeExpr::Str(n) => *n as usize,
+                        TypeExpr::Record(rname) => {
+                            self.record_types
+                                .get(rname)
+                                .map(|r| r.size as usize)
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "codegen: sub param record `{}` not defined",
+                                        rname
+                                    )
+                                })
+                        }
                         other => panic!("codegen: sub param type {:?} not supported", other),
                     };
                     if self.symbols.iter().any(|s| s.name == *pname) {
@@ -199,23 +210,53 @@ impl Codegen {
                 args.len()
             );
         }
+        // Copy-in
         for (i, arg) in args.iter().enumerate() {
-            let (pname, _) = &params[i];
-            self.emit_expr(arg);
+            let (pname, pty) = &params[i];
             let param_slot = self.lookup_symbol(pname).offset_in_data;
-            self.emit_mov_imm64_reloc(RBX, param_slot);
-            self.emit_mov_at_rbx_rax();
+            match pty {
+                TypeExpr::UInt(_) | TypeExpr::UDec(_, _) | TypeExpr::IDec(_, _) => {
+                    self.emit_expr(arg);
+                    self.emit_mov_imm64_reloc(RBX, param_slot);
+                    self.emit_mov_at_rbx_rax();
+                }
+                TypeExpr::Str(_) | TypeExpr::Record(_) => {
+                    let size = self.type_size_dyn(pty);
+                    let (arg_off, _) = self.resolve_expr_address(arg);
+                    self.emit_mov_imm64_reloc(RSI, arg_off);
+                    self.emit_mov_imm64_reloc(RDI, param_slot);
+                    self.emit_mov_imm64(RCX, size);
+                    self.code.push(0xFC);
+                    self.code.extend_from_slice(&[0xF3, 0xA4]);
+                }
+                other => panic!("codegen: sub param type {:?} not supported", other),
+            }
         }
         self.emit_call_paragraph(name);
+        // Copy-out (for lvalue args)
         for (i, arg) in args.iter().enumerate() {
-            if let Expr::Ident(arg_name) = arg {
-                let (pname, _) = &params[i];
-                let param_slot = self.lookup_symbol(pname).offset_in_data;
-                let arg_slot = self.lookup_symbol(arg_name).offset_in_data;
-                self.emit_mov_imm64_reloc(RBX, param_slot);
-                self.emit_mov_rax_from_rbx();
-                self.emit_mov_imm64_reloc(RBX, arg_slot);
-                self.emit_mov_at_rbx_rax();
+            if !matches!(arg, Expr::Ident(_) | Expr::FieldAccess { .. }) {
+                continue;
+            }
+            let (pname, pty) = &params[i];
+            let param_slot = self.lookup_symbol(pname).offset_in_data;
+            let (arg_off, _) = self.resolve_expr_address(arg);
+            match pty {
+                TypeExpr::UInt(_) | TypeExpr::UDec(_, _) | TypeExpr::IDec(_, _) => {
+                    self.emit_mov_imm64_reloc(RBX, param_slot);
+                    self.emit_mov_rax_from_rbx();
+                    self.emit_mov_imm64_reloc(RBX, arg_off);
+                    self.emit_mov_at_rbx_rax();
+                }
+                TypeExpr::Str(_) | TypeExpr::Record(_) => {
+                    let size = self.type_size_dyn(pty);
+                    self.emit_mov_imm64_reloc(RSI, param_slot);
+                    self.emit_mov_imm64_reloc(RDI, arg_off);
+                    self.emit_mov_imm64(RCX, size);
+                    self.code.push(0xFC);
+                    self.code.extend_from_slice(&[0xF3, 0xA4]);
+                }
+                _ => {}
             }
         }
     }
@@ -278,6 +319,9 @@ impl Codegen {
                 .get(rname)
                 .map(|r| r.size)
                 .unwrap_or_else(|| panic!("codegen: unknown record `{}`", rname)),
+            TypeExpr::Array { element, length } => {
+                self.type_size_dyn(element) * (*length as u64)
+            }
             other => type_size(other),
         }
     }
@@ -350,6 +394,7 @@ impl Codegen {
         let flags: u64 = match mode_name.as_str() {
             "input" => 0,    // O_RDONLY
             "output" => 577, // O_WRONLY | O_CREAT | O_TRUNC = 1 | 64 | 512
+            "i_o" => 2,      // O_RDWR
             other => panic!("codegen: unknown file mode `{}`", other),
         };
         let path_off = self.file_path_offset(&file_name);
@@ -377,6 +422,41 @@ impl Codegen {
         self.emit_mov_imm64_reloc(RBX, fd_off);
         self.emit_mov_rdi_from_rbx();
         self.emit_mov_imm64(RAX, 3); // sys_close
+        self.emit_syscall();
+    }
+
+    fn emit_file_rewrite(&mut self, args: &[Expr]) {
+        if args.len() != 2 {
+            panic!("codegen: rewrite() takes 2 args");
+        }
+        let file_name = match &args[0] {
+            Expr::Ident(n) => n.clone(),
+            _ => panic!("codegen: rewrite() first arg must be a file ident"),
+        };
+        let rec_name = match &args[1] {
+            Expr::Ident(n) => n.clone(),
+            _ => panic!("codegen: rewrite() second arg must be a record ident"),
+        };
+        let fd_off = self.file_fd_offset(&file_name);
+        let rec_offset = self.lookup_symbol(&rec_name).offset_in_data;
+        let rec_size = self.record_size_of(&rec_name);
+
+        // sys_lseek(fd, -rec_size, SEEK_CUR)
+        self.emit_mov_imm64_reloc(RBX, fd_off);
+        self.emit_mov_rdi_from_rbx();
+        self.emit_mov_imm64(RAX, 8); // sys_lseek
+        self.emit_mov_imm64(RSI, rec_size);
+        // neg rsi (0x48 0xF7 0xDE)
+        self.code.extend_from_slice(&[0x48, 0xF7, 0xDE]);
+        self.emit_mov_imm64(RDX, 1); // SEEK_CUR
+        self.emit_syscall();
+
+        // sys_write(fd, buf, count)
+        self.emit_mov_imm64_reloc(RBX, fd_off);
+        self.emit_mov_rdi_from_rbx();
+        self.emit_mov_imm64(RAX, 1);
+        self.emit_mov_imm64_reloc(RSI, rec_offset);
+        self.emit_mov_imm64(RDX, rec_size);
         self.emit_syscall();
     }
 
@@ -514,6 +594,230 @@ impl Codegen {
         // Found - end
         let end = self.code.len();
         self.patch_rel32(exit_jump, end);
+    }
+
+    fn emit_string_concat(&mut self, args: &[Expr]) {
+        if args.len() < 2 {
+            panic!("codegen: string_concat() needs at least 2 args (target, src1, ...)");
+        }
+        let (target_off, target_width) = {
+            let (off, ty) = self.resolve_expr_address(&args[0]);
+            match ty {
+                TypeExpr::Str(w) => (off, w),
+                _ => panic!("codegen: string_concat target must be str(N)"),
+            }
+        };
+        let mut cursor: u32 = 0;
+        for src in &args[1..] {
+            let (src_off, src_len) = match src {
+                Expr::Ident(_) | Expr::FieldAccess { .. } => {
+                    let (off, ty) = self.resolve_expr_address(src);
+                    let w = match ty {
+                        TypeExpr::Str(w) => w,
+                        _ => panic!("codegen: string_concat src must be str-typed or literal"),
+                    };
+                    (off, w)
+                }
+                Expr::StringLit(s) => {
+                    let bytes = s.as_bytes().to_vec();
+                    let off = self.data.len() as u64;
+                    let len = bytes.len() as u32;
+                    self.data.extend(bytes);
+                    (off, len)
+                }
+                _ => panic!("codegen: string_concat src must be ident or string literal"),
+            };
+            if cursor + src_len > target_width {
+                panic!(
+                    "codegen: string_concat sources ({} so far + {}) exceed target str({})",
+                    cursor, src_len, target_width
+                );
+            }
+            self.emit_mov_imm64_reloc(RSI, src_off);
+            self.emit_mov_imm64_reloc(RDI, target_off + cursor as u64);
+            self.emit_mov_imm64(RCX, src_len as u64);
+            self.code.push(0xFC);
+            self.code.extend_from_slice(&[0xF3, 0xA4]);
+            cursor += src_len;
+        }
+        if cursor < target_width {
+            let pad = target_width - cursor;
+            self.emit_mov_imm64_reloc(RDI, target_off + cursor as u64);
+            self.emit_mov_imm64(RCX, pad as u64);
+            self.emit_mov_imm64(RAX, b' ' as u64);
+            self.code.push(0xFC);
+            // rep stosb (F3 AA)
+            self.code.extend_from_slice(&[0xF3, 0xAA]);
+        }
+    }
+
+    fn emit_unstring(&mut self, args: &[Expr]) {
+        if args.len() < 3 {
+            panic!("codegen: unstring() needs at least 3 args (src, delim, target1, ...)");
+        }
+        let (src_off, src_width) = {
+            let (off, ty) = self.resolve_expr_address(&args[0]);
+            match ty {
+                TypeExpr::Str(w) => (off, w),
+                _ => panic!("codegen: unstring src must be str(N)"),
+            }
+        };
+        let delim = match &args[1] {
+            Expr::StringLit(s) if s.len() == 1 => s.as_bytes()[0],
+            _ => panic!("codegen: unstring delim must be single-char string literal"),
+        };
+
+        // Use RBX as src cursor offset (we'll initialize via lea-style)
+        // Strategy: RSI = src pointer (advancing), saved between targets.
+        // RDI = target pointer (per target).
+        // For each target, scan: copy until delim or src_end or target full.
+        // src_end = src_off + src_width.
+
+        // Initialize RSI to src start, store src_end as immediate per check.
+        self.emit_mov_imm64_reloc(RSI, src_off);
+        // Use R8 for src_end? No, we don't have R8 defined. Just compute at the check.
+        // Actually we use RBX for src_end.
+        self.emit_mov_imm64_reloc(RBX, src_off + src_width as u64);
+
+        for target in &args[2..] {
+            let (tgt_off, tgt_width) = {
+                let (off, ty) = self.resolve_expr_address(target);
+                match ty {
+                    TypeExpr::Str(w) => (off, w),
+                    _ => panic!("codegen: unstring target must be str(N)"),
+                }
+            };
+            self.emit_mov_imm64_reloc(RDI, tgt_off);
+            self.emit_mov_imm64(RCX, tgt_width as u64);
+
+            // Copy loop:
+            //   if rsi >= rbx (src_end): pad rest of target with spaces, done.
+            //   if [rsi] == delim: inc rsi (skip delim), pad rest of target with spaces, done.
+            //   if rcx == 0: target full; advance rsi past next delim or end; done.
+            //   else: copy byte; inc rsi; inc rdi; dec rcx; loop.
+
+            let loop_start = self.code.len();
+            // cmp rsi, rbx
+            self.code.extend_from_slice(&[0x48, 0x39, 0xDE]); // cmp rsi, rbx
+            let jae_eof = self.emit_jae_placeholder();
+            // cmp byte [rsi], delim
+            self.code.extend_from_slice(&[0x80, 0x3E, delim]);
+            let je_at_delim = self.emit_je_placeholder();
+            // test rcx, rcx (if target full)
+            self.code.extend_from_slice(&[0x48, 0x85, 0xC9]);
+            let jz_full = self.emit_jz_placeholder();
+            // copy byte: mov al, [rsi]; mov [rdi], al
+            self.code.extend_from_slice(&[0x8A, 0x06]); // mov al, [rsi]
+            self.code.extend_from_slice(&[0x88, 0x07]); // mov [rdi], al
+            // inc rsi, inc rdi, dec rcx
+            self.code.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+            self.code.extend_from_slice(&[0x48, 0xFF, 0xC7]);
+            self.code.extend_from_slice(&[0x48, 0xFF, 0xC9]);
+            self.emit_jmp_back_to(loop_start);
+
+            // at_delim: skip delim
+            let at_delim = self.code.len();
+            self.patch_rel32(je_at_delim, at_delim);
+            self.code.extend_from_slice(&[0x48, 0xFF, 0xC6]); // inc rsi
+            let after_delim_skip = self.emit_jmp_placeholder();
+
+            // jz_full: advance rsi past next delim or end (for next target)
+            let target_full = self.code.len();
+            self.patch_rel32(jz_full, target_full);
+            // scan rsi until [rsi] == delim or rsi == rbx
+            let scan_start = self.code.len();
+            self.code.extend_from_slice(&[0x48, 0x39, 0xDE]); // cmp rsi, rbx
+            let jae_scan_end = self.emit_jae_placeholder();
+            self.code.extend_from_slice(&[0x80, 0x3E, delim]);
+            let je_found = self.emit_je_placeholder();
+            self.code.extend_from_slice(&[0x48, 0xFF, 0xC6]); // inc rsi
+            self.emit_jmp_back_to(scan_start);
+            let scan_done = self.code.len();
+            self.patch_rel32(je_found, scan_done);
+            self.code.extend_from_slice(&[0x48, 0xFF, 0xC6]); // inc rsi (skip delim)
+            self.patch_rel32(jae_scan_end, self.code.len());
+            let after_target_full = self.emit_jmp_placeholder();
+
+            // jae_eof: out of src, pad target rest with spaces
+            let eof_label = self.code.len();
+            self.patch_rel32(jae_eof, eof_label);
+            // RCX is bytes remaining in target, RDI is current write pos
+            // mov al, ' '; rep stosb
+            self.emit_mov_imm64(RAX, b' ' as u64);
+            self.code.push(0xFC);
+            self.code.extend_from_slice(&[0xF3, 0xAA]);
+            // Make src effectively at end (rsi = rbx) so subsequent targets get padded too.
+            self.code.extend_from_slice(&[0x48, 0x89, 0xDE]); // mov rsi, rbx
+            let after_eof = self.emit_jmp_placeholder();
+
+            // Common pad block (after delim or at EOF): pad rest of target with spaces.
+            let pad_block = self.code.len();
+            self.patch_rel32(after_delim_skip, pad_block);
+            self.patch_rel32(after_eof, pad_block);
+            // RCX still has remaining bytes for this target.
+            self.emit_mov_imm64(RAX, b' ' as u64);
+            self.code.push(0xFC);
+            self.code.extend_from_slice(&[0xF3, 0xAA]);
+
+            // Common "next target" point.
+            let next_target = self.code.len();
+            self.patch_rel32(after_target_full, next_target);
+        }
+    }
+
+    fn emit_je_placeholder(&mut self) -> usize {
+        // je rel32: 0F 84 + 4-byte placeholder (same as jz)
+        self.code.push(0x0F);
+        self.code.push(0x84);
+        let pos = self.code.len();
+        self.code.extend_from_slice(&[0u8; 4]);
+        pos
+    }
+
+    fn emit_jae_placeholder(&mut self) -> usize {
+        // jae rel32 (unsigned >=): 0F 83 + 4-byte placeholder
+        self.code.push(0x0F);
+        self.code.push(0x83);
+        let pos = self.code.len();
+        self.code.extend_from_slice(&[0u8; 4]);
+        pos
+    }
+
+    fn emit_replace_chars(&mut self, args: &[Expr]) {
+        if args.len() != 3 {
+            panic!("codegen: replace_chars() takes 3 args: str, needle, replacement");
+        }
+        let (str_off, str_width) = {
+            let (off, ty) = self.resolve_expr_address(&args[0]);
+            match ty {
+                TypeExpr::Str(w) => (off, w),
+                _ => panic!("codegen: replace_chars first arg must be a str-typed variable"),
+            }
+        };
+        let needle = match &args[1] {
+            Expr::StringLit(s) if s.len() == 1 => s.as_bytes()[0],
+            _ => panic!("codegen: replace_chars needle must be single-char string literal"),
+        };
+        let replacement = match &args[2] {
+            Expr::StringLit(s) if s.len() == 1 => s.as_bytes()[0],
+            _ => panic!("codegen: replace_chars replacement must be single-char string literal"),
+        };
+        self.emit_mov_imm64_reloc(RSI, str_off);
+        self.emit_mov_imm64(RCX, str_width as u64);
+
+        let loop_start = self.code.len();
+        // cmp byte [rsi], needle
+        self.code.extend_from_slice(&[0x80, 0x3E, needle]);
+        let jne_skip = self.emit_jne_placeholder();
+        // mov byte [rsi], replacement
+        self.code.extend_from_slice(&[0xC6, 0x06, replacement]);
+        let skip = self.code.len();
+        self.patch_rel32(jne_skip, skip);
+        // inc rsi
+        self.code.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+        // dec rcx
+        self.code.extend_from_slice(&[0x48, 0xFF, 0xC9]);
+        self.emit_jnz_rel32_back_to(loop_start);
     }
 
     fn emit_count_chars(&mut self, args: &[Expr]) {
@@ -660,6 +964,10 @@ impl Codegen {
                         });
                         self.data.extend_from_slice(&vec![0u8; info.size as usize]);
                     }
+                    (TypeExpr::Array { .. }, _) => {
+                        let size = self.type_size_dyn(ty) as usize;
+                        self.data.extend_from_slice(&vec![0u8; size]);
+                    }
                     (TypeExpr::File, _) => {
                         panic!("codegen: file type cannot appear in `let` declaration");
                     }
@@ -687,6 +995,13 @@ impl Codegen {
                         panic!("codegen: no field `{}` in record `{}`", field, base_record)
                     })
             }
+            LValue::Index { base, .. } => {
+                let base_ty = self.lvalue_type(base);
+                match base_ty {
+                    TypeExpr::Array { element, .. } => *element,
+                    other => panic!("codegen: cannot index non-array type {:?}", other),
+                }
+            }
         }
     }
 
@@ -708,6 +1023,9 @@ impl Codegen {
                     });
                 base_offset + f.offset
             }
+            LValue::Index { .. } => {
+                panic!("codegen: array element address is dynamic, use emit_lvalue_addr")
+            }
         }
     }
 
@@ -723,6 +1041,9 @@ impl Codegen {
             }
             LValue::Field { .. } => {
                 panic!("codegen: nested record field access not supported yet");
+            }
+            LValue::Index { .. } => {
+                panic!("codegen: array element record access not supported yet");
             }
         }
     }
@@ -778,6 +1099,14 @@ impl Codegen {
                     self.emit_file_read(args);
                 } else if name == "write" {
                     self.emit_file_write(args);
+                } else if name == "rewrite" {
+                    self.emit_file_rewrite(args);
+                } else if name == "replace_chars" {
+                    self.emit_replace_chars(args);
+                } else if name == "string_concat" {
+                    self.emit_string_concat(args);
+                } else if name == "unstring" {
+                    self.emit_unstring(args);
                 } else if self.is_sub(name) {
                     self.emit_call_sub(name, args);
                 } else if self.has_paragraph(name) {
@@ -1070,14 +1399,51 @@ impl Codegen {
 
     fn emit_assign(&mut self, target: &LValue, value: &Expr) {
         let target_ty = self.lvalue_type(target);
-        let target_offset = self.lvalue_data_offset(target);
-        if let TypeExpr::Str(width) = target_ty {
+        if matches!(target, LValue::Index { .. }) {
+            if let TypeExpr::Str(_) | TypeExpr::Record(_) = target_ty {
+                panic!("codegen: array element of str/record not yet supported in assign");
+            }
+            self.emit_lvalue_addr(target);
+            // RAX has the address; save it
+            self.emit_push_rax();
+            self.emit_expr(value);
+            // Now RAX is value, RBX top-of-stack is address
+            self.code.push(0x5B); // pop rbx
+            self.emit_mov_at_rbx_rax();
+        } else if let TypeExpr::Str(width) = target_ty {
+            let target_offset = self.lvalue_data_offset(target);
             let source_offset = self.resolve_str_operand(value, width);
             self.emit_str_copy(source_offset, target_offset, width);
         } else {
+            let target_offset = self.lvalue_data_offset(target);
             self.emit_expr(value);
             self.emit_mov_imm64_reloc(RBX, target_offset);
             self.emit_mov_at_rbx_rax();
+        }
+    }
+
+    fn emit_lvalue_addr(&mut self, lv: &LValue) {
+        // Puts the address into RAX.
+        match lv {
+            LValue::Ident(_) | LValue::Field { .. } => {
+                let off = self.lvalue_data_offset(lv);
+                self.emit_mov_imm64_reloc(RAX, off);
+            }
+            LValue::Index { base, idx } => {
+                let base_ty = self.lvalue_type(base);
+                let elem_size = match &base_ty {
+                    TypeExpr::Array { element, .. } => self.type_size_dyn(element),
+                    _ => panic!("not an array"),
+                };
+                let base_off = self.lvalue_data_offset(base);
+                self.emit_expr(idx);
+                // dec rax (idx -> 0-based)
+                self.code.extend_from_slice(&[0x48, 0xFF, 0xC8]);
+                self.emit_mov_imm64(RBX, elem_size);
+                self.emit_imul_rax_rbx();
+                self.emit_mov_imm64_reloc(RBX, base_off);
+                self.emit_add_rax_rbx();
+            }
         }
     }
 
@@ -1430,6 +1796,39 @@ impl Codegen {
                 self.emit_mov_imm64_reloc(RBX, offset);
                 self.emit_mov_rax_from_rbx();
             }
+            Expr::Index { base, idx } => {
+                // Resolve base type to find element size.
+                let base_name = match base.as_ref() {
+                    Expr::Ident(n) => n.clone(),
+                    _ => panic!("codegen: array index base must be a simple ident"),
+                };
+                let sym = self.lookup_symbol(&base_name).clone();
+                let (elem_ty, base_off) = match &sym.ty {
+                    TypeExpr::Array { element, .. } => {
+                        (element.as_ref().clone(), sym.offset_in_data)
+                    }
+                    _ => panic!("codegen: `{}` is not an array", base_name),
+                };
+                let elem_size = self.type_size_dyn(&elem_ty);
+                // Compute address
+                self.emit_expr(idx);
+                self.code.extend_from_slice(&[0x48, 0xFF, 0xC8]); // dec rax
+                self.emit_mov_imm64(RBX, elem_size);
+                self.emit_imul_rax_rbx();
+                self.emit_mov_imm64_reloc(RBX, base_off);
+                self.emit_add_rax_rbx();
+                // Load element value
+                match elem_ty {
+                    TypeExpr::UInt(_) | TypeExpr::UDec(_, _) | TypeExpr::IDec(_, _) => {
+                        // mov rax, [rax]
+                        self.code.extend_from_slice(&[0x48, 0x8B, 0x00]);
+                    }
+                    _ => panic!(
+                        "codegen: array element of type {:?} not loadable as expression yet",
+                        elem_ty
+                    ),
+                }
+            }
             Expr::StringLit(_) => {
                 panic!("codegen: string literals cannot appear in runtime expressions");
             }
@@ -1772,6 +2171,7 @@ fn type_size(ty: &TypeExpr) -> u64 {
         TypeExpr::UDec(_, _) | TypeExpr::IDec(_, _) => 8,
         TypeExpr::Record(_) => panic!("codegen: nested record fields not supported yet"),
         TypeExpr::File => panic!("codegen: file type cannot be a field"),
+        TypeExpr::Array { element, length } => type_size(element) * (*length as u64),
     }
 }
 
@@ -1824,6 +2224,7 @@ fn try_eval_const(expr: &Expr) -> Option<ConstValue> {
         | Expr::And { .. }
         | Expr::Or { .. }
         | Expr::FieldAccess { .. }
+        | Expr::Index { .. }
         | Expr::Call { .. } => None,
         Expr::BinaryOp { op, left, right } => {
             let l = match try_eval_const(left)? {

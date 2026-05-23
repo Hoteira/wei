@@ -1,0 +1,15 @@
+let arr uint(3)[5]
+let i uint(3) = 0
+let total uint(5) = 0
+
+par main:
+    for i in 1..6:
+        arr[i] = i * i
+    for i in 1..6:
+        total = total + arr[i]
+        print(arr[i])
+        print(" ")
+    print("=")
+    print(total)
+
+main()

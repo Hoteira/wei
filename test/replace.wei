@@ -1,0 +1,12 @@
+let name str(10) = "HELLOWORLD"
+
+par main:
+    print(name)
+    print("|")
+    replace_chars(name, "L", "z")
+    print(name)
+    print("|")
+    replace_chars(name, "O", "X")
+    print(name)
+
+main()

@@ -1,0 +1,42 @@
+type Employee:
+    emp_name str(20)
+    emp_salary udec(7,2)
+
+file out_file = "/tmp/rewrite.dat" sequential
+file io_file = "/tmp/rewrite.dat" sequential
+file in_file = "/tmp/rewrite.dat" sequential
+let emp Employee
+let total udec(9,2) = 0
+
+par make_initial:
+    open(out_file, output)
+    emp.emp_name = "Alice"
+    emp.emp_salary = 1000.50
+    write(out_file, emp)
+    emp.emp_name = "Bob"
+    emp.emp_salary = 2000.00
+    write(out_file, emp)
+    close(out_file)
+
+par update_alice:
+    open(io_file, i_o)
+    read(io_file, emp)
+    emp.emp_salary = 5000.00
+    rewrite(io_file, emp)
+    close(io_file)
+
+par verify:
+    open(in_file, input)
+    read(in_file, emp)
+    while !at_end(in_file):
+        total = total + emp.emp_salary
+        read(in_file, emp)
+    close(in_file)
+    print(total)
+
+par main:
+    make_initial()
+    update_alice()
+    verify()
+
+main()

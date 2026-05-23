@@ -1,0 +1,15 @@
+let src str(20) = "alpha,beta,gamma"
+let a str(8)
+let b str(8)
+let c str(8)
+
+par main:
+    unstring(src, ",", a, b, c)
+    print(a)
+    print("|")
+    print(b)
+    print("|")
+    print(c)
+    print("|")
+
+main()

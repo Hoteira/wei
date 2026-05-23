@@ -81,6 +81,7 @@ pub enum Pattern {
 pub enum LValue {
     Ident(String),
     Field { base: Box<LValue>, field: String },
+    Index { base: Box<LValue>, idx: Box<Expr> },
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +92,7 @@ pub enum TypeExpr {
     IDec(u32, u32),
     Record(String),
     File,
+    Array { element: Box<TypeExpr>, length: u32 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -112,7 +114,7 @@ pub enum CmpOp {
     Ge,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Expr {
     StringLit(String),
     IntLit(i64),
@@ -142,6 +144,10 @@ pub enum Expr {
     FieldAccess {
         base: Box<Expr>,
         field: String,
+    },
+    Index {
+        base: Box<Expr>,
+        idx: Box<Expr>,
     },
     Call {
         name: String,

@@ -1,0 +1,9 @@
+include "inc_lib.wei"
+
+let n uint(3) = 7
+
+par main:
+    doubler(n)
+    print(n)
+
+main()

@@ -1,0 +1,10 @@
+let result str(20)
+let first str(5) = "Hello"
+let last str(5) = "World"
+
+par main:
+    string_concat(result, first, " ", last, "!")
+    print(result)
+    print("|")
+
+main()

@@ -1,0 +1,28 @@
+type Pair:
+    a uint(3)
+    b uint(3)
+
+let p Pair
+let scratch uint(3) = 0
+let name str(10) = "Hello"
+
+sub swap_pair(x Pair):
+    scratch = x.a
+    x.a = x.b
+    x.b = scratch
+
+sub yellify(s str(10)):
+    replace_chars(s, "l", "L")
+
+par main:
+    p.a = 1
+    p.b = 9
+    swap_pair(p)
+    print(p.a)
+    print("|")
+    print(p.b)
+    print("|")
+    yellify(name)
+    print(name)
+
+main()
